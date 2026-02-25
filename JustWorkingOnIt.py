@@ -9,7 +9,12 @@ import time as TM
 from scipy.linalg import eigh
 from scipy.sparse.linalg import eigsh
 from scipy.sparse.linalg import ArpackNoConvergence
+
 import jax
+import jax.numpy as jnp
+from ddp_vmap_jax import ilqr_ddp_batched, ILQRConfig
+from .ipoptax.solver import solve as ipoptax_solve
+from functools import partial
 
 """
 Reference
@@ -38,9 +43,9 @@ class MPC_Planner:
         self.cl0    = sysm_para[10] # the cable length [m]
         self.ro     = sysm_para[11] # the radius of obstacle [m]
         # Unit direction vector free of coordinate
-        self.ex     = np.array([[1, 0, 0]]).T
-        self.ey     = np.array([[0, 1, 0]]).T
-        self.ez     = np.array([[0, 0, 1]]).T
+        self.ex     = jnp.array([[1, 0, 0]]).T
+        self.ey     = jnp.array([[0, 1, 0]]).T
+        self.ez     = jnp.array([[0, 0, 1]]).T
         # Gravitational acceleration
         self.g      = 9.81      
         self.dt     = dt_ctrl
@@ -51,16 +56,899 @@ class MPC_Planner:
         # lower bound of the ADMM penalty parameter
         self.p_min  = 1e-3
 
-        # before are the original code,
-        # below are code newly added for JAX implementation
+        # before are the original code except the "jnp",
+
+        self.rp = np.array([[0.05, 0.05, 0.0]]).T # 参照 main 脚本的 rp0
+        self.rg = (self.m2 / self.ml) * self.rp
+        # below are code newly add for JAX implementation
+        self._load_derivs_jit = jax.jit(MPC_Planner._static_load_derivs)
+        self._cable_derivs_jit = jax.jit(MPC_Planner._static_cable_derivs)
+        # 1. allocation matrix
+
+        # 我们在 __init__ 里一次性把所有死的数据（如分配矩阵 Pt）算好，变成固定的常量。
+        # 这样 JAX 编译时就知道这是一块“石头”，不需要再去追踪它的变化。
+
         self.alpha  = 2*np.pi/self.nq
+        r0          = np.array([[self.rl,0,0]]).T - np.reshape(np.vstack((self.rg[0],self.rg[1],0)),(3,1))  # 1st cable attachment point in {Bl}
+        self.ra     = r0
+        S_r0        = self.skew_sym_numpy(r0)
+        I3          = np.identity(3) # 3-by-3 identity matrix
+        self.Pt      = np.vstack((I3,S_r0))
+        for i in range(int(self.nq)-1):
+            ri      = np.array([[self.rl*(math.cos((i+1)*self.alpha)),self.rl*(math.sin((i+1)*self.alpha)),0]]).T - np.reshape(np.vstack((self.rg[0],self.rg[1],0)),(3,1))
+            S_ri    = self.skew_sym_numpy(ri)
+            Pi      = np.vstack((I3,S_ri))
+            self.Pt = np.append(self.Pt,Pi,axis=1) # the tension mapping matrix: 6-by-3nq with a rank of 6
+            self.ra = np.append(self.ra,ri,axis=1) # a matrix that stores the attachment points
+        
+        self.Pt = jnp.array(self.Pt)
+        self.ra = jnp.array(self.ra)
+
+
+        # 障碍物位置初始化 (先设为0，后续由 Main 传入)
+        self.pob1 = jnp.zeros(3)
+        self.pob2 = jnp.zeros(3)
+
+
+        # 2. subproblem 1
+        self._load_solver_jit = jax.jit(
+            partial(ilqr_ddp_batched,
+                    dynamics_fn=MPC_Planner.jax_load_dynamics,
+                    cost_fn=MPC_Planner.jax_load_stage_cost,
+                    term_cost_fn=MPC_Planner.jax_load_terminal_cost),
+            static_argnames=['cfg']
+        )
+        self._cable_solver_jit = jax.jit(
+            partial(ilqr_ddp_batched,
+                    dynamics_fn=MPC_Planner.jax_cable_dynamics_single,
+                    cost_fn=MPC_Planner.jax_cable_stage_cost,
+                    term_cost_fn=MPC_Planner.jax_cable_terminal_cost),
+            static_argnames=['cfg']
+        )
+        # 3. subproblem 2
+        def subp2_pure_func(Para2_dict):
+            return self.jax_ADMM_SubP2(Para2_dict)
+        
+        self._subp2_jit = jax.jit(subp2_pure_func)
+
+        # 4. 状态维度定义
+
+
+        # 负载状态 (pl, vl, ql, wl)
+        #    * 状态 `xl`：
+        #        * pl (位置): 3维
+        #        * vl (速度): 3维
+        #        * ql (四元数): 4维
+        #        * wl (角速度): 3维
+        #        * 合计：$3 + 3 + 4 + 3 = 13$
+        #    * 控制 `ul`：
+        #        * Fl (合力): 3维
+        #        * Ml (合力矩): 3维
+        #        * 合计：$3 + 3 = 6$
+        self.nxl = 13
+        self.nul = 6
+
+        # 缆绳状态 (di, wi, ti, vti)
+        #     * 状态 `xi`：
+        #        * di (缆绳方向): 3维
+        #        * wi (缆绳角速度): 3维
+        #        * ti (张力大小): 1维
+        #        * vti (张力变化率): 1维
+        #        * 合计：$3 + 3 + 1 + 1 = 8$
+        #    * 控制 `ui`：
+        #        * dwi (角加速度): 3维
+        #        * ati (张力加速度): 1维
+        #        * 合计：$3 + 1 = 4$
+        self.nxi = 8
+        self.nui = 4
+
+        # 超参数维度 (来自 Gradient_Solver 的配置)
+        self.npl = 2 * self.nxl + self.nul + 4 # 状态权重 + 控制权重 + 4个动态调度参数
+        self.npi = 2 * self.nxi + self.nui + 4
+        self.n_Pauto = self.npl + self.npi
+
+
+        # 5. Rotational_Inertia
+        ratio_m    = self.m1*self.m2/self.ml
+        self.Jl    = self.Jlcom + ratio_m*(rp.T@rp*np.identity(3)-rp@rp.T)
+        self.Jl  =  jnp.array(self.Jl) #变成jnp
+        self.Jl_inv = jnp.linalg.inv(jnp.array(self.Jl))# 逆矩阵
+
+    @staticmethod
+    def _static_load_derivs(xs, us, params_b):
+        """[JAX 静态算子] 并行提取负载轨迹的 Jacobian 和反馈增益"""
+        def _calc_step(x, u, p):
+            dyn = MPC_Planner.jax_load_dynamics
+            cost = MPC_Planner.jax_load_stage_cost
+            # 计算动力学 Jacobian
+            fx = jax.jacfwd(dyn, 0)(x, u, p)
+            fu = jax.jacfwd(dyn, 1)(x, u, p)
+            # 计算代价函数 Hessian 和 Jacobian (用于反馈增益 K_fb)
+            luu = jax.hessian(cost, 1)(x, u, p)
+            lxu = jax.jacfwd(jax.grad(cost, 0), 1)(x, u, p)
+            # 正则化求逆 (确保数值稳定性)
+            Quu_inv = jnp.linalg.inv(luu + 1e-6 * jnp.eye(u.shape[0]))
+            K_fb = - Quu_inv @ lxu.T
+            return Quu_inv, lxu, K_fb, fx, fu
+
+        # 对整条轨迹进行映射
+        def _scan_time(xs_seq, us_seq, p_single):
+            return jax.vmap(_calc_step, in_axes=(0, 0, None))(xs_seq[:-1], us_seq, p_single)
+
+        return jax.vmap(_scan_time, in_axes=(0, 0, 0))(xs, us, params_b)
+
+    @staticmethod
+    def _static_cable_derivs(xs, us, params_b):
+        """[JAX 静态算子] 并行提取所有缆绳轨迹的导数"""
+        def _calc_step(x, u, p):
+            dyn = MPC_Planner.jax_cable_dynamics_single
+            cost = MPC_Planner.jax_cable_stage_cost
+            fx = jax.jacfwd(dyn, 0)(x, u, p)
+            fu = jax.jacfwd(dyn, 1)(x, u, p)
+            luu = jax.hessian(cost, 1)(x, u, p)
+            lxu = jax.jacfwd(jax.grad(cost, 0), 1)(x, u, p)
+            Quu_inv = jnp.linalg.inv(luu + 1e-6 * jnp.eye(u.shape[0]))
+            K_fb = - Quu_inv @ lxu.T
+            return Quu_inv, lxu, K_fb, fx, fu
+
+        def _scan_time(xs_seq, us_seq, p_single):
+            return jax.vmap(_calc_step, in_axes=(0, 0, None))(xs_seq[:-1], us_seq, p_single)
+
+        return jax.vmap(_scan_time, in_axes=(0, 0, 0))(xs, us, params_b)
+
+
+    @staticmethod
+    def jax_load_dynamics(x, u, params):
+        '''新增的 jax 版本的负载动力学模型'''
+        # 1. 状态提取 (保持一维数组，方便求导)
+        # pl = x[0:3] # 位置
+        vl = x[3:6]   # 速度 (世界系)
+        ql = x[6:10]  # 四元数 [q0, q1, q2, q3]
+        wl = x[10:13] # 角速度 (机体系)
+
+        # 2. 控制输入 [总拉力(世界系), 总力矩(机体系)]
+        Fl = u[0:3]
+        Ml = u[3:6]
+
+        # 3. 核心物理计算 (解耦模型)
+        dpl = vl
+        dvl = -9.81 * jnp.array([0.0, 0.0, 1.0]) + (1.0 / params['ml']) * Fl
+
+        # 四元数导数: dq = 0.5 * q \otimes [0, w]
+        # 这里使用矩阵形式以获得更好的 JIT 性能
+        q0, q1, q2, q3 = ql[0], ql[1], ql[2], ql[3]
+        w1, w2, w3 = wl[0], wl[1], wl[2]
+        Omega = jnp.array([
+            [0, -w1, -w2, -w3],
+            [w1, 0, w3, -w2],
+            [w2, -w3, 0, w1],
+            [w3, w2, -w1, 0]
+        ])
+        dql = 0.5 * Omega @ ql
+
+        # 角加速度: dw = J_inv @ (M - w x Jw)
+        dwl = params['Jl_inv'] @ (Ml - jnp.cross(wl, params['Jl'] @ wl))
+
+        return jnp.concatenate([dpl, dvl, dql, dwl])
+
+    @staticmethod
+    def jax_cable_dynamics_single(x, u, params):
+        '''新增的 jax 版本的缆绳动力学模型'''
+        # 1. 状态提取
+        di = x[0:3]   # 方向向量
+        wi = x[3:6]   # 线速度（摆动角速度）
+        # ti = x[6]   # 张力 (不需要参与状态转移计算，但它是状态)
+        vti = x[7]    # 张力变化率
+
+        # 2. 控制输入
+        dwi = u[0:3]  # 线加速度
+        ati = u[3]    # 张力加速度
+
+        # 3. 物理方程
+        # di_dot = wi x di (保持方向向量在单位球面上运动)
+        di_dot = jnp.cross(wi, di)
+
+        wi_dot = dwi
+        ti_dot = vti
+        ti_ddot = ati
+
+        return jnp.concatenate([di_dot, wi_dot, jnp.array([ti_dot, ti_ddot])])
+
+
+    @staticmethod
+    def jax_load_stage_cost(x, u, params):
+        """新增的 jax 版本的负载的单步运行代价 (Running Cost)"""
+        # 1. 基础 Tracking 误差 (靠近参考轨迹)
+        diff_x_ref = x - params['ref_x']
+        diff_u_ref = u - params['ref_u']
+
+        # 2. ADMM 一致性误差 (靠近 SubP2 算出的共识 scx, scu)
+        # 这里 y 是对偶变量 (Lagrangian multiplier)，rho 是罚权重
+        # 对应原版 resid_xl = x - scxl + scxL/p
+        resid_x = x - params['scx'] + params['y_x'] / (params['rho_lx'] + 1e-6)
+        resid_u = u - params['scu'] + params['y_u'] / (params['rho_lu'] + 1e-6)
+
+        # 3. 汇总加权和
+        # 注意：params['Q'] 和 params['R'] 应该是对角阵或权重向量
+        cost = 0.5 * (jnp.sum(diff_x_ref**2 * params['Q_weight']) +
+                    jnp.sum(diff_u_ref**2 * params['R_weight']))
+
+        # ADMM 罚项
+        cost += 0.5 * params['rho_lx'] * jnp.sum(resid_x**2)
+        cost += 0.5 * params['rho_lu'] * jnp.sum(resid_u**2)
+
+        return cost
+
+
+    @staticmethod
+    def jax_load_terminal_cost(x, params):
+        """[修正版] 负载终点代价：统一使用 rho_lx"""
+        # 1. 基础误差
+        diff_x_ref = x - params['ref_x']
+
+        # 2. 一致性残差 (修正：将 rho 改为 rho_lx)
+        resid_x = x - params['scx'] + params['y_x'] / (params['rho_lx'] + 1e-6)
+
+        # 3. 汇总
+        cost = 0.5 * jnp.sum(diff_x_ref**2 * params['Q_terminal_weight'])
+        cost += 0.5 * params['rho_lx'] * jnp.sum(resid_x**2)
+
+        return cost    
+
+    @staticmethod
+    def jax_cable_stage_cost(x, u, params):
+        """[修正版] 单根缆绳单步运行代价：区分状态和控制罚项"""
+        # 1. 基础 Tracking 误差
+        diff_x_ref = x - params['ref_x_i']
+        diff_u_ref = u - params['ref_u_i']
+
+        # 2. ADMM 一致性残差 (使用各自的 rho)
+        # pix_dis 对应状态, piu_dis 对应控制
+        resid_x = x - params['scx_i'] + params['y_x_i'] / (params['rho_ix'] + 1e-6)#  1e-6 as Numerical Guard
+        resid_u = u - params['scu_i'] + params['y_u_i'] / (params['rho_iu'] + 1e-6)
+
+        # 3. 汇总 Cost
+        # 基础跟踪权重 (Qi, Ri)
+        cost = 0.5 * (jnp.sum(diff_x_ref**2 * params['Qi_weight']) +
+                    jnp.sum(diff_u_ref**2 * params['Ri_weight']))
+
+        # 动态 ADMM 罚项
+        cost += 0.5 * params['rho_ix'] * jnp.sum(resid_x**2)
+        cost += 0.5 * params['rho_iu'] * jnp.sum(resid_u**2)
+
+        return cost
+
+    @staticmethod
+    def jax_cable_terminal_cost(x, params):
+        """[修正版] 单根缆绳终点代价"""
+        diff_x_ref = x - params['ref_x_i']
+        # 终点通常只看状态一致性
+        resid_x = x - params['scx_i'] + params['y_x_i'] / (params['rho_ix'] + 1e-6)
+
+        cost = 0.5 * jnp.sum(diff_x_ref**2 * params['Qi_terminal_weight'])
+        cost += 0.5 * params['rho_ix'] * jnp.sum(resid_x**2)
+
+        return cost
+
+
+    def jax_MPC_Cable_DDP_Planning_SubP1(self, ParaC):
+        """
+        [JAX] 缆绳子问题 1 求解器
+        实现智能体间并行 DDP 规划，并同步提取 ADMM 所需导数
+        """
+        B, N, nx, nu = len(ParaC), int(self.N), 8, 4
+        x0_list, u_init_list, params_list = [], [], []
+
+        # --- 1. 严格索引审计与数据打包 ---
+        for i in range(B):
+            parai = ParaC[i]
+            idx = 0
+            # 初值 [8]
+            xi_fb = parai[idx : idx+nx]; idx += nx
+            # 参考轨迹 (N+1)步 [8*(N+1)]
+            ref_x = parai[idx : idx+nx*(N+1)]; idx += nx*(N+1)
+            # 线缆参考控制 (单步) [4]
+            ref_ui = parai[idx : idx+nu]; idx += nu
+            # 共识状态 (N+1)步
+            scxi = parai[idx : idx+nx*(N+1)]; idx += nx*(N+1)
+            # 状态对偶变量 (N+1)步
+            scxI = parai[idx : idx+nx*(N+1)]; idx += nx*(N+1)
+            # 共识控制 N步
+            scui = parai[idx : idx+nu*N]; idx += nu*N
+            # 控制对偶变量 N步
+            scuI = parai[idx : idx+nu*N]; idx += nu*N
+            # 权重参数 (UseThis 变长版)
+            weight_para = parai[idx : -1]
+            i_admm = parai[-1]
+
+            # 计算动态惩罚项 rho (状态与控制解耦)
+            rho_ix = self.open_loop_penalty_jax(weight_para[-4], weight_para[-2], i_admm, self.max_iter_ADMM)
+            rho_iu = self.open_loop_penalty_jax(weight_para[-3], weight_para[-1], i_admm, self.max_iter_ADMM)
+
+            x0_list.append(jnp.array(xi_fb, dtype=jnp.float32))
+            u_init_list.append(jnp.array(scui, dtype=jnp.float32).reshape(N, nu))
+
+            params_list.append({
+                'rho_ix': rho_ix, 'rho_iu': rho_iu,
+                'ref_x_i': jnp.array(ref_x).reshape(N+1, nx),
+                'ref_u_i': jnp.array(ref_ui),
+                'scx_i': jnp.array(scxi).reshape(N+1, nx),
+                'scu_i': jnp.array(scui).reshape(N, nu),
+                'y_x_i': jnp.array(scxI).reshape(N+1, nx),
+                'y_u_i': jnp.array(scuI).reshape(N, nu),
+                'Qi_weight': jnp.array(weight_para[0:nx]),
+                'Ri_weight': jnp.array(weight_para[2*nx:2*nx+nu]),
+                'Qi_terminal_weight': jnp.array(weight_para[nx:2*nx])
+            })
+
+        # --- 2. 批量并行求解 ---
+        params_b = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *params_list)
+        x0_batch = jnp.stack(x0_list)
+        u_batch  = jnp.stack(u_init_list)
+
+        cfg = ILQRConfig(max_iters=5, tol_g_norm=1e-3)
+        results = self._cable_solver_jit(x0_batch, u_batch, params_b, cfg=cfg)
+
+        # --- 3. 批量提取导数 (Jacobian/Hessian) ---
+        # 使用 __init__ 中定义的 _cable_derivs_jit
+        derivs = self._cable_derivs_jit(results.xs, results.us, params_b)
+        Quu_inv_np, Qxu_np, K_fb_np, Fx_np, Fu_np = [np.array(d) for d in derivs]
+
+        # --- 4. 结果还原与接口适配 ---
+        xs_np, us_np = np.array(results.xs), np.array(results.us)
+        opt_solc = {"xc_traj": [xs_np[i] for i in range(B)], "uc_traj": [us_np[i] for i in range(B)]}
+
+        OPt_sol_c = []
+        for i in range(B):
+            OPt_sol_c.append({
+                'xi_traj': xs_np[i], 'ui_traj': us_np[i],
+                'K_FB': K_fb_np[i], 'Quu_inv': Quu_inv_np[i],
+                'Qxu': Qxu_np[i], 'Fx': Fx_np[i], 'Fu': Fu_np[i]
+            })
+
+        return opt_solc, OPt_sol_c
+
+
+    def jax_MPC_Load_DDP_Planning_SubP1(self, ParaL):
+        """
+        [JAX] 负载子问题 1 求解器
+        ParaL: 来自 ADMM 主循环的负载参数包列表 (通常 B=1)
+        """
+        B, N, nx, nu = len(ParaL), int(self.N), 13, 6
+        x0_list, u_guess_list, params_list = [], [], []
+
+        # --- 1. 严格索引审计 (针对 COM_Dyn + UseThis 逻辑) ---
+        for i in range(B):
+            Parai = ParaL[i]
+            idx = 0
+            # (1) 初值 xl_fb [13]
+            xl_fb = Parai[idx : idx+nx]; idx += nx
+            # (2) 参考轨迹 Ref_xl [13*(N+1)], Ref_ul [6*N]
+            Ref_xl_raw = Parai[idx : idx+nx*(N+1)]; idx += nx*(N+1)
+            Ref_ul_raw = Parai[idx : idx+nu*N]; idx += nu*N
+            # (3) 共识轨迹 scxl [13*(N+1)], scul [6*N] (来自上一次 SubP2)
+            scxl_raw = Parai[idx : idx+nx*(N+1)]; idx += nx*(N+1)
+            scul_raw = Parai[idx : idx+nu*N]; idx += nu*N
+            # (4) 对偶变量 scxL [13*(N+1)], scuL [6*N] (来自上一次 SubP3)
+            scxL_raw = Parai[idx : idx+nx*(N+1)]; idx += nx*(N+1)
+            scuL_raw = Parai[idx : idx+nu*N]; idx += nu*N
+            # (5) 权重超参数 para_l [2*nx + nu + 4]
+            weight_para = Parai[idx:-1]
+            i_admm = Parai[-1]
+
+            # 计算 UseThis 版动态惩罚 rho
+            # weight_para[-4]: px, weight_para[-2]: gammax
+            rho_lx = self.open_loop_penalty_jax(weight_para[-4], weight_para[-2], i_admm, self.max_iter_ADMM)
+            rho_lu = self.open_loop_penalty_jax(weight_para[-3], weight_para[-1], i_admm, self.max_iter_ADMM)
+
+            x0_list.append(jnp.array(xl_fb, dtype=jnp.float32))
+            # DDP 初始猜想：使用上一轮的共识控制量 scul
+            u_guess_list.append(jnp.array(scul_raw, dtype=jnp.float32).reshape(N, nu))
+
+            # 构造 params 字典 (必须与 jax_load_stage_cost 接口严格对应)
+            params_list.append({
+                'ml': float(self.ml),
+                'Jl': jnp.array(self.Jl, dtype=jnp.float32),
+                'Jl_inv': jnp.array(self.Jl_inv, dtype=jnp.float32),
+                'rho_lx': rho_lx,
+                'rho_lu': rho_lu,
+                'ref_x': jnp.array(Ref_xl_raw, dtype=jnp.float32).reshape(N+1, nx),
+                'ref_u': jnp.array(Ref_ul_raw, dtype=jnp.float32).reshape(N, nu),
+                'scx': jnp.array(scxl_raw, dtype=jnp.float32).reshape(N+1, nx),
+                'scu': jnp.array(scul_raw, dtype=jnp.float32).reshape(N, nu),
+                'y_x': jnp.array(scxL_raw, dtype=jnp.float32).reshape(N+1, nx),
+                'y_u': jnp.array(scuL_raw, dtype=jnp.float32).reshape(N, nu),
+                'Q_weight': jnp.array(weight_para[0:nx], dtype=jnp.float32),
+                'R_weight': jnp.array(weight_para[2*nx:2*nx+nu], dtype=jnp.float32),
+                'Q_terminal_weight': jnp.array(weight_para[nx:2*nx], dtype=jnp.float32)
+            })
+
+        # --- 2. 打包并点火 (JAX 魔法) ---
+        params_b = jax.tree_util.tree_map(lambda *args: jnp.stack(args), *params_list)
+        x0_b = jnp.stack(x0_list)
+        u_init_b = jnp.stack(u_guess_list)
+
+        # 调用 JIT 编译好的 DDP 求解器
+        cfg = ILQRConfig(max_iters=10, tol_g_norm=1e-3) # 这里可以微调参数
+        results = self._load_solver_jit(x0_b, u_init_b, params_b, cfg=cfg)
+
+        # --- 3. 提取导数 (为 ADMM 协同做准备) ---
+        # 这一步通过 vmap 同时算全时域导数，比原版快得多
+        derivs = self._load_derivs_jit(results.xs, results.us, params_b)
+        Quu_inv_np, Qxu_np, K_fb_np, Fx_np, Fu_np = [np.array(d) for d in derivs]
+
+        # --- 4. 结果适配并返回 (保持与原版 ADMM 接口兼容) ---
+        xs_np = np.array(results.xs)
+        us_np = np.array(results.us)
+
+        opt_soll = {
+            "xl_traj": [xs_np[i] for i in range(B)],
+            "ul_traj": [us_np[i] for i in range(B)]
+        }
+
+        OPt_sol_l = []
+        for i in range(B):
+            OPt_sol_l.append({
+                'xl_traj': xs_np[i],
+                'ul_traj': us_np[i],
+                'K_FB': K_fb_np[i],
+                'Quu_inv': Quu_inv_np[i],
+                'Qxu': Qxu_np[i],
+                'Fx': Fx_np[i],
+                'Fu': Fu_np[i]
+            })
+
+        return opt_soll, OPt_sol_l
+
+
+    @staticmethod
+    def _ipoptax_unpack(w, dims):
+        """将决策向量 w 拆解为负载和缆绳的物理量"""
+        nxl, nul, nxi, nui, nq = dims
+        xl = w[0:nxl]
+        ul = w[nxl:nxl+nul]
+        # 缆绳部分 reshape
+        rem = w[nxl+nul:].reshape(nq, nxi + nui)
+        xc_mat = rem[:, 0:nxi]
+        uc_mat = rem[:, nxi:]
+        return xl, ul, xc_mat, uc_mat
     
-    def Rotational_Inertia(self,rp):
+    @staticmethod
+    def ipoptax_objective(w, params_t, dims):
+        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
+
+        # 负载的一致性项
+        # resid = x - x_ideal + y/rho
+        res_xl = xl - params_t['xl_ideal'] + params_t['y_xl'] / params_t['rho_l']
+        res_ul = ul - params_t['ul_ideal'] + params_t['y_ul'] / params_t['rho_l']
+        cost = 0.5 * params_t['rho_l'] * (jnp.sum(res_xl**2) + jnp.sum(res_ul**2))
+
+        # 缆绳的一致性项 (Batch 操作)
+        res_xc = xc_mat - params_t['xc_ideal'] + params_t['y_xc'] / params_t['rho_i']
+        res_uc = uc_mat - params_t['uc_ideal'] + params_t['y_uc'] / params_t['rho_i']
+        cost += 0.5 * params_t['rho_i'] * (jnp.sum(res_xc**2) + jnp.sum(res_uc**2))
+
+        return cost
+
+    @staticmethod
+    def ipoptax_equality(w, params_t, dims):
+        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
+        eqs = []
+
+        # (1) 负载四元数归一化
+        ql = xl[6:10]
+        eqs.append(jnp.sum(ql**2) - 1.0)
+
+        # (2) 每根缆绳的方向向量归一化
+        di_vecs = xc_mat[:, 0:3] # (nq, 3)
+        eqs.append(jnp.sum(di_vecs**2, axis=1) - 1.0)
+
+        # (3) Wrench Consensus (力与力矩的一致性)
+        # 负载挂点位置 (ra) + 绳子方向 * 张力 = 总合力/合力矩
+        Rl = MPC_Planner._q_2_rotation_jax(ql)
+        ti_mags = uc_mat[:, 0] # 张力是控制量的第一维
+        fi_inertial = di_vecs * ti_mags[:, None]
+        # 将力转到机体系计算力矩
+        fi_body = (Rl.T @ fi_inertial.T).T
+
+        # 合力一致性 (Pt 矩阵派上用场了)
+        # Pt @ [f1, f2... fn] = target_wrench (6维)
+        wrench_generated = params_t['Pt'] @ fi_body.flatten()
+        eqs.append(wrench_generated - ul)
+
+        return jnp.concatenate([jnp.atleast_1d(e).flatten() for e in eqs])
+
+    @staticmethod
+    def ipoptax_inequality(w, params_t, dims):
+        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
+        ineqs = []
+
+        # (1) 负载避障 (R_safe^2 - d^2 <= 0)
+        pl = xl[0:3]
+        safe_r_l = params_t['rl'] + params_t['ro']
+        ineqs.append(safe_r_l**2 - jnp.sum((pl[:2] - params_t['pob1'][:2])**2))
+        ineqs.append(safe_r_l**2 - jnp.sum((pl[:2] - params_t['pob2'][:2])**2))
+
+        # (2) 无人机避障 (每一架都要检查)
+        # pi = pl + Rl@ri + L*di
+        Rl = MPC_Planner._q_2_rotation_jax(xl[6:10])
+        di_vecs = xc_mat[:, 0:3]
+        pi_mat = pl[:, None] + Rl @ params_t['ra'] + params_t['cl0'] * di_vecs.T
+
+        safe_r_q = params_t['rq'] + params_t['ro']
+        dist_to_obs1 = jnp.sum((pi_mat[:2, :].T - params_t['pob1'][:2])**2, axis=1)
+        ineqs.append(safe_r_q**2 - dist_to_obs1)
+
+        # (3) 张力限制 (ti_min <= ti <= ti_max)
+        ti_mags = uc_mat[:, 0]
+        ineqs.append(0.1 - ti_mags) # ti >= 0.1 -> 0.1 - ti <= 0
+        ineqs.append(ti_mags - 5.0) # ti <= 5.0 -> ti - 5.0 <= 0
+
+        return jnp.concatenate([jnp.atleast_1d(i).flatten() for i in ineqs])
+
+    def jax_ADMM_SubP2(self, Para2_dict):
+        """
+        [JAX 终极版] 子问题 2：利用 ipoptax 实现全时域并行硬约束优化
+        """
+        N, nq = self.N, int(self.nq)
+        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
+        dims = (nxl, nul, nxi, nui, nq)
+
+        # --- 1. 数据对齐与 Batch 构造 (Time-step Parallelism) ---
+        # 这一步将 Para2_dict 中的 1D 数组还原为 (N+1, Dim)
+        w_init_batch, params_batch = self._prepare_subp2_batch(Para2_dict)
+
+        # --- 2. 定义单步求解闭包 (适配 ipoptax) ---
+        def run_ipoptax_step(x_init, p_t):
+            # 将静态方法包装为 ipoptax 需要的接口
+            f = lambda x: MPC_Planner.ipoptax_objective(x, p_t, dims)
+            c = lambda x: MPC_Planner.ipoptax_equality(x, p_t, dims)
+            g = lambda x: MPC_Planner.ipoptax_inequality(x, p_t, dims)
+
+            # 调用 ipoptax 核心求解器
+            # 我们在这里预设一些初始乘子
+            res = ipoptax_solve(
+                f=f, c=c, g=g,
+                ws_x=x_init,
+                ws_s=jnp.ones(2 + nq*2 + nq*2), # 松弛变量数量：负载避障(2) + 飞机避障(nq*2) + 张力(nq*2)
+                ws_y=jnp.zeros(1 + nq + 6),     # 等式乘子：四元数(1) + 缆绳模长(nq) + 力平衡(6)
+                ws_z=jnp.ones(2 + nq*2 + nq*2), # 不等式乘子
+                max_iterations=50,
+                print_logs=False
+            )
+            return res['x']
+
+        # --- 3. 核心魔法：时间维度的向量化 (vmap) ---
+        # 只有这一行代码，就实现了全时域并行！
+        batch_solver = jax.vmap(run_ipoptax_step, in_axes=(0, 0))
+
+        # --- 4. 执行求解 ---
+        # w_opt_batch 形状为 (N+1, Total_Dim)
+        w_opt_batch = batch_solver(w_init_batch, params_batch)
+
+        # --- 5. 结果拆解与还原 (NumPy 适配) ---
+        return self._unpack_subp2_results(w_opt_batch)
+
+    def _unpack_subp2_results(self, w_opt_batch):
+        """
+        [JAX 血管函数] 将 SubP2 并行算出的 Tensor 拆解回 ADMM 轨迹格式
+        w_opt_batch shape: (N+1, Total_Dim)
+        """
+        N, nq = self.N, int(self.nq)
+        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
+
+        # 1. 拆解负载 (Payload) 部分
+        scxl_traj = w_opt_batch[:, 0:nxl] # (N+1, 13)
+        scul_traj = w_opt_batch[:N, nxl:nxl+nul] # (N, 6) 控制量只取前 N 个
+
+        # 2. 拆解缆绳 (Cables) 部分
+        # 把剩下的变量 reshape 为 (N+1, nq, nxi + nui)
+        cables_part = w_opt_batch[:, nxl+nul:].reshape(N + 1, nq, nxi + nui)
+
+        # 分离状态和控制
+        scxc_batch = cables_part[:, :, 0:nxi] # (N+1, nq, 8)
+        scuc_batch = cables_part[:N, :, nxi:] # (N, nq, 4)
+
+        # 为了兼容原版代码中 list of arrays 的习惯，我们进行最后的转换
+        scxc_traj_list = []
+        scuc_traj_list = []
+        for i in range(nq):
+            # scxc_traj_list 里的每个元素是 (N+1, 8)
+            scxc_traj_list.append(np.array(scxc_batch[:, i, :]))
+            # scuc_traj_list 里的每个元素是 (N, 4)
+            scuc_traj_list.append(np.array(scuc_batch[:, i, :]))
+
+        return {
+            'scxl_traj': np.array(scxl_traj),
+            'scul_traj': np.array(scul_traj),
+            'scxc_traj': scxc_traj_list,
+            'scuc_traj': scuc_traj_list
+        }
+
+
+    def _prepare_subp2_batch(self, Para2):
+        """
+        [JAX 血管函数] 为并行 ipoptax 准备全时域 Batch 数据
+        """
+        N, nq = self.N, int(self.nq)
+        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
+
+        # --- 1. 基础物理量提取与广播 ---
+        # 我们把这些静态常数复制 N+1 份，方便 vmap 同时读取
+        params_batch = {
+            'rho_l': jnp.full((N+1,), Para2['rho_l']), # 动态状态罚项
+            'rho_i': jnp.full((N+1,), Para2['rho_i']), # 动态线缆罚项
+            'rl':    jnp.full((N+1,), self.rl),
+            'ro':    jnp.full((N+1,), self.ro),
+            'rq':    jnp.full((N+1,), self.rq),
+            'cl0':   jnp.full((N+1,), self.cl0),
+            'p_bar': jnp.full((N+1,), self.p_bar),
+
+            # 广播 2D/3D 矩阵
+            'Pt':    jnp.tile(self.Pt[None, ...], (N+1, 1, 1)),
+            'ra':    jnp.tile(self.ra[None, ...], (N+1, 1, 1)),
+            'pob1':  jnp.tile(self.pob1[None, ...], (N+1, 1)),
+            'pob2':  jnp.tile(self.pob2[None, ...], (N+1, 1)),
+
+            # 提取 DDP 算出的理想值 (作为引导)
+            'xl_ideal': jnp.array(Para2['xl_ideal']), # (N+1, 13)
+            'ul_ideal': jnp.array(Para2['ul_ideal']), # (N, 6)
+            'xc_ideal': jnp.array(Para2['xc_ideal']), # (nq, N+1, 8)
+            'uc_ideal': jnp.array(Para2['uc_ideal']), # (nq, N, 4)
+
+            # 提取当前的对偶变量
+            'y_xl': jnp.array(Para2['y_xl']),
+            'y_ul': jnp.array(Para2['y_ul']),
+            'y_xc': jnp.array(Para2['y_xc']), # (nq, N+1, 8)
+            'y_uc': jnp.array(Para2['y_uc'])  # (nq, N, 4)
+        }
+
+        # --- 2. 构造 w_init (每一行代表一个时刻的初始猜想) ---
+
+        # (A) 负载状态与控制
+        xl_init = params_batch['xl_ideal']
+        # 控制量补齐第 N+1 个点（全零）
+        ul_init = jnp.concatenate([params_batch['ul_ideal'], jnp.zeros((1, nul))], axis=0)
+
+        # (B) 缆绳状态：(nq, N+1, 8) -> (N+1, nq*8)
+        # 核心：必须转置，确保时间维在第一位，然后压扁智能体维度
+        xc_init_flat = params_batch['xc_ideal'].transpose(1, 0, 2).reshape(N+1, -1)
+
+        # (C) 缆绳控制：(nq, N, 4) -> (N+1, nq*4)
+        # 先对每根绳子补齐第 N+1 个点
+        uc_padded = jnp.concatenate([params_batch['uc_ideal'], jnp.zeros((nq, 1, nui))], axis=1)
+        uc_init_flat = uc_padded.transpose(1, 0, 2).reshape(N+1, -1)
+
+        # (D) 终极拼接：[负载状态, 负载控制, 所有缆绳状态, 所有缆绳控制]
+        w_init = jnp.concatenate([xl_init, ul_init, xc_init_flat, uc_init_flat], axis=1)
+
+        return w_init, params_batch
+
+
+    def jax_ADMM_forward_MPC(self, Ref_xl, Ref_ul, ref_xq, ref_uq, xl_fb, xq_fb, paral, parac, max_iter_ADMM):
+        """
+        [JAX 全并行版] ADMM 前向规划主流程
+        """
+        # --- 1. 轨迹初始化 ---
+        scxl_traj, scul_traj, scxc_traj, scuc_traj = self._initialize_trajectories(Ref_xl, Ref_ul, ref_xq, ref_uq)
+        y_xl, y_ul = jnp.zeros_like(scxl_traj), jnp.zeros_like(scul_traj)
+        y_xc, y_uc = jnp.zeros_like(scxc_traj), jnp.zeros_like(scuc_traj)
+
+        # --- 2. ADMM 迭代大循环 ---
+        for i_admm in range(max_iter_ADMM):
+            # --- (A) 子问题 1：并行 DDP 规划 ---
+            ParaL = self._pack_paraL(xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm)
+            ParaC = self._pack_paraC(xq_fb, ref_xq, ref_uq, parac, scxc_traj, scuc_traj, y_xc, y_uc, i_admm)
+
+            sol1_load, _ = self.jax_MPC_Load_DDP_Planning_SubP1(ParaL)
+            sol1_cable, _ = self.jax_MPC_Cable_DDP_Planning_SubP1(ParaC)
+
+            xl_opt = sol1_load['xl_traj'][0]
+            ul_opt = sol1_load['ul_traj'][0]
+            xc_opt = jnp.array(sol1_cable['xc_traj']) # (nq, N+1, 8)
+            uc_opt = jnp.array(sol1_cable['uc_traj']) # (nq, N, 4)
+
+            # --- (B) 子问题 2：并行一致性投影 (ipoptax) ---
+            Para2 = self._pack_para2(xl_opt, ul_opt, xc_opt, uc_opt, y_xl, y_ul, y_xc, y_uc, paral, paraC, i_admm)
+            sol2 = self.jax_ADMM_SubP2(Para2)
+
+            scxl_cons = sol2['scxl_traj']
+            scul_cons = sol2['scul_traj']
+            scxc_cons = sol2['scxc_traj']
+            scuc_cons = sol2['scuc_traj']
+
+            # --- (C) 子问题 3：对偶变量更新 (正式归队！) ---
+            # 调用我们之前改好的 JAX 版 SubP3
+            sol3 = self.jax_ADMM_SubP3(
+                xl_opt, scxl_cons, y_xl, ul_opt, scul_cons, y_ul,
+                xc_opt, scxc_cons, y_xc, uc_opt, scuc_cons, y_uc,
+                paral[-4], paral[-3], paral[-2], paral[-1],
+                paraC[-4], paraC[-3], paraC[-2], paraC[-1],
+                max_iter_ADMM, i_admm
+            )
+
+            # 更新对偶变量，存入下一轮
+            y_xl, y_ul = sol3['scxL_traj_new'], sol3['scuL_traj_new']
+            y_xc, y_uc = sol3['scxC_traj_new'], sol3['scuC_traj_new']
+
+            # 同时更新 SubP2 用的共识变量
+            scxl_traj, scul_traj = scxl_cons, scul_cons
+            scxc_traj, scuc_traj = scxc_cons, scuc_cons
+
+            # --- (D) 收敛性检查 ---
+            # ...
+
+        return {
+            'load_trajectory': xl_opt,
+            'cable_trajectories': xc_opt,
+            'control_inputs': ul_opt
+        }
+
+    def _initialize_trajectories(self, Ref_xl, Ref_ul, ref_xq, ref_uq):
+        """
+        [JAX 移植版] 轨迹初始化逻辑 (对应原版 L1624-L1650)
+        """
+        N, nq = self.N, self.nq
+
+        # 1. 负载轨迹初始化
+        # 原版逻辑：从 Ref_xl[0] 开始，根据 Ref_ul 用动力学模型推演一遍
+        scxl_traj = [jnp.array(Ref_xl[0:self.nxl])] # 起点
+        for k in range(N):
+            x_next = self.jax_load_dynamics(scxl_traj[-1], Ref_ul[k*self.nul:(k+1)*self.nul], self._get_static_params())
+            # 简单的欧拉积分 (或者你可以用更复杂的 RK4)
+            scxl_traj.append(scxl_traj[-1] + self.dt * x_next)
+        scxl_traj = jnp.stack(scxl_traj)
+        scul_traj = jnp.array(Ref_ul).reshape(N, self.nul)
+
+        # 2. 缆绳轨迹初始化
+        scxc_traj_list = []
+        scuc_traj_list = []
+        for i in range(nq):
+            xi_curr = jnp.array(ref_xq[i][0:self.nxi])
+            xi_traj_i = [xi_curr]
+            ui_seq_i = jnp.array(ref_uq[i*self.nui:(i+1)*self.nui]) # 原版是单步参考
+
+            for k in range(N):
+                xi_next_dot = self.jax_cable_dynamics_single(xi_traj_i[-1], ui_seq_i, self._get_static_params())
+                xi_traj_i.append(xi_traj_i[-1] + self.dt * xi_next_dot)
+
+            scxc_traj_list.append(jnp.stack(xi_traj_i))
+            # 控制量初始化 (复制 N 份)
+            scuc_traj_list.append(jnp.tile(ui_seq_i, (N, 1)))
+
+        return (
+            scxl_traj,
+            scul_traj,
+            jnp.stack(scxc_traj_list),
+            jnp.stack(scuc_traj_list)
+        )
+
+    def _get_static_params(self):
+        """[JAX 血管函数] 返回 JAX 算子需要的静态物理字典"""
+        return {
+            'ml': float(self.ml),
+            'Jl': jnp.array(self.Jl, dtype=jnp.float32),
+            'Jl_inv': jnp.array(self.Jl_inv, dtype=jnp.float32),
+            'g': 9.81,
+            'ez': jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+        }
+
+    def _pack_paraL(self, xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm):
+        # 负载只有一个，所以返回一个只包含一个元素的列表
+        # 顺序严格遵守原版审计结果：初值, 参考x, 参考u, 共识x, 对偶x, 共识u, 对偶u, 权重, 迭代步
+        paral_arr = np.concatenate((
+            xl_fb.flatten(),
+            Ref_xl.flatten(),
+            Ref_ul.flatten(),
+            scxl_traj.flatten(),
+            y_xl.flatten(),
+            scul_traj.flatten(),
+            y_ul.flatten(),
+            paral.flatten(),
+            [float(i_admm)]
+        ))
+        return [paral_arr] # 返回列表以适配 B=1 的 Batch 模式
+
+    def _pack_paraC(self, xq_fb, ref_xq, ref_uq, paraC, scxc_traj, scuc_traj, y_xc, y_uc, i_admm):
+        ParaC_list = []
+        for i in range(self.nq):
+            # 这里的切片必须非常精准
+            parai = np.concatenate((
+                xq_fb[i*self.nxi : (i+1)*self.nxi], # 初值
+                ref_xq[i].flatten(),                # 参考状态轨迹
+                ref_uq[i*self.nui : (i+1)*self.nui], # 线缆参考控制 (单步)
+                scxc_traj[i].flatten(),             # 共识状态
+                y_xc[i].flatten(),                  # 状态对偶
+                scuc_traj[i].flatten(),             # 共识控制
+                y_uc[i].flatten(),                  # 控制对偶
+                paraC.flatten(),                    # 缆绳超参数
+                [float(i_admm)]                     # 迭代步数
+            ))
+            ParaC_list.append(parai)
+        return ParaC_list
+
+    def _pack_para2(self, xl_opt, ul_opt, xc_opt, uc_opt, y_xl, y_ul, y_xc, y_uc, paral, paraC, i_admm):
+        # 子问题 2 需要的是一个字典，里面存着全时域的张量
+        # 这样在 ADMM_SubP2 内部可以用 vmap 轻松拆解
+        return {
+            'xl_ideal': xl_opt,  # (N+1, 13)
+            'ul_ideal': ul_opt,  # (N, 6)
+            'xc_ideal': xc_opt,  # (nq, N+1, 8)
+            'uc_ideal': uc_opt,  # (nq, N, 4)
+            'y_xl': y_xl,
+            'y_ul': y_ul,
+            'y_xc': y_xc,
+            'y_uc': y_uc,
+            'rho_l': self.open_loop_penalty_jax(paral[-4], paral[-2], i_admm, self.max_iter_ADMM),
+            'rho_i': self.open_loop_penalty_jax(paraC[-4], paraC[-2], i_admm, self.max_iter_ADMM),
+            'pob1': self.pob1,
+            'pob2': self.pob2
+        }
+
+
+    @staticmethod
+    def jax_subp3_update(xl_opt, scxl_cons, y_xl_old, rho_lx, ul_opt, scul_cons, y_ul_old, rho_lu):
+        """
+        [JAX 版] 负载对偶变量更新
+        """
+        # 对偶变量更新公式：y_new = y_old + rho * (primal - consensus)
+        y_xl_new = y_xl_old + rho_lx * (xl_opt - scxl_cons)
+        y_ul_new = y_ul_old + rho_lu * (ul_opt - scul_cons)
+        return y_xl_new, y_ul_new
+
+    @staticmethod
+    def jax_subp3_update_cable(xc_opt, scxc_cons, y_xc_old, rho_ix, uc_opt, scuc_cons, y_uc_old, rho_iu):
+        """
+        [JAX 版] 缆绳对偶变量并行更新 (利用 JAX 的自动广播机制)
+        """
+        # 由于 xc_opt 等已经是 (nq, N+1, dim) 的 Batch 形状
+        # JAX 会自动进行并行化的加减法
+        y_xc_new = y_xc_old + rho_ix[:, None, None] * (xc_opt - scxc_cons)
+        y_uc_new = y_uc_old + rho_iu[:, None, None] * (uc_opt - scuc_cons)
+        return y_xc_new, y_uc_new
+
+    def jax_ADMM_SubP3(self, xl_traj, scxl_traj, scxL_traj, ul_traj, scul_traj, scuL_traj,
+                  xc_traj, scxc_traj, scxC_traj, uc_traj, scuc_traj, scuC_traj,
+                  px, pu, gammax, gammau, pix, piu, gammaix, gammaiu, ADMM_max, i_admm):
+        """
+        子问题 3 的类成员包装器
+        """
+        # 1. 计算当前步的动态惩罚系数
+        rho_lx = self.open_loop_penalty_jax(px, gammax, i_admm, ADMM_max)
+        rho_lu = self.open_loop_penalty_jax(pu, gammau, i_admm, ADMM_max)
+
+        # 2. 调用 JAX 纯函数更新负载对偶变量
+        y_xl_new, y_ul_new = self.jax_subp3_update(
+            xl_traj, scxl_traj, scxL_traj, rho_lx,
+            ul_traj, scul_traj, scuL_traj, rho_lu
+        )
+
+        # 3. 计算缆绳的动态惩罚 (对每一个无人机)
+        # 假设所有无人机共享这套参数，JAX 会处理广播
+        rho_ix = self.open_loop_penalty_jax(pix, gammaix, i_admm, ADMM_max)
+        rho_iu = self.open_loop_penalty_jax(piu, gammaiu, i_admm, ADMM_max)
+
+        # 4. 调用 JAX 纯函数更新缆绳对偶变量
+        y_xc_new, y_uc_new = self.jax_subp3_update_cable(
+            xc_traj, scxc_traj, scxC_traj, jnp.atleast_1d(rho_ix),
+            uc_traj, scuc_traj, scuC_traj, jnp.atleast_1d(rho_iu)
+        )
+
+        return {
+            'scxL_traj_new': np.array(y_xl_new),
+            'scuL_traj_new': np.array(y_ul_new),
+            'scxC_traj_new': np.array(y_xc_new),
+            'scuC_traj_new': np.array(y_uc_new)
+        }
+
+
+
+    def Rotational_Inertia(self,rp):  # TODO: Deprecated Type 1
         # rp=(x,y,0), a column vector, is the coordinate of the point-mass added on the uniform circular plate in its body frame 
         ratio_m    = self.m1*self.m2/self.ml
         self.Jl    = self.Jlcom + ratio_m*(rp.T@rp*np.identity(3)-rp@rp.T)
 
-    def allocation_martrix(self,rg):
+    def allocation_martrix(self,rg):  # TODO: Deprecated Type 1
         self.alpha  = 2*np.pi/self.nq
         r0          = np.array([[self.rl,0,0]]).T - np.reshape(np.vstack((rg[0],rg[1],0)),(3,1))  # 1st cable attachment point in {Bl}
         self.ra     = r0
@@ -74,7 +962,7 @@ class MPC_Planner:
             self.Pt = np.append(self.Pt,Pi,axis=1) # the tension mapping matrix: 6-by-3nq with a rank of 6
             self.ra = np.append(self.ra,ri,axis=1) # a matrix that stores the attachment points
     
-    def skew_sym_numpy(self, v):
+    def skew_sym_numpy(self, v): # TODO: Type2 
         v_cross = np.array([
             [0, -v[2, 0], v[1, 0]],
             [v[2, 0], 0, -v[0, 0]],
@@ -82,38 +970,63 @@ class MPC_Planner:
         )
         return v_cross
     
-    def skew_sym(self, v): # skew-symmetric operator
+    def skew_sym(self, v):# TODO: Type2  # skew-symmetric operator
         v_cross = vertcat(
             horzcat(0, -v[2,0], v[1,0]),
             horzcat(v[2,0], 0, -v[0,0]),
             horzcat(-v[1,0], v[0,0], 0)
         )
         return v_cross
+    
+    @staticmethod
+    def skew_sym_jax(v):
+        """新增的 JAX 版本的向量叉乘的矩阵形式 """
+        # v 是一个 3 维向量 [vx, vy, vz]
+        return jnp.array([
+            [0.0, -v[2], v[1]],
+            [v[2], 0.0, -v[0]],
+            [-v[1], v[0], 0.0]
+        ])
 
+    def SetStateVariables(self, xl, xi): # TODO: Deprecated Type 1
+        """Initialize symbolic state variables along with their bounds."""
+        self.xl = xl
+        self.xi = xi
+        self.nxl = int(xl.numel())
+        self.nxi = int(xi.numel())
+        nq = int(self.nq)
+        cable_stack_dim = self.nxi * nq
 
-    def SetStateVariables(self, xl, xi):
-        self.xl    = xl
-        self.xi    = xi
-        self.nxl   = xl.numel()
-        self.nxi   = xi.numel()
-        self.scxc  = SX.sym('scxc',self.nxi*int(self.nq))
-        self.xc    = SX.sym('xc',self.nxi*int(self.nq))
-        self.scxC  = SX.sym('scxC',self.nxi*int(self.nq))
-        self.scxl  = SX.sym('scxl',self.nxl)
-        self.scxi  = SX.sym('scxi',self.nxi)
-        self.scxL  = SX.sym('scxL',self.nxl) # Lagrangian multiplier of xl
-        self.scxI  = SX.sym('scxI',self.nxi) # Lagrangian multiplier of xi
-        self.xl_lb = self.nxl*[-1e19]
-        self.xl_ub = self.nxl*[1e19]
-        self.xi_lb = self.nxi*[-1e19]
-        self.xi_ub = self.nxi*[1e19]
+        # Safe copies and Lagrange multipliers for ADMM
+        self.scxc = SX.sym('scxc', cable_stack_dim)
+        self.xc = SX.sym('xc', cable_stack_dim)
+        self.scxC = SX.sym('scxC', cable_stack_dim)
+        self.scxl = SX.sym('scxl', self.nxl)
+        self.scxi = SX.sym('scxi', self.nxi)
+        self.scxL = SX.sym('scxL', self.nxl)  # Lagrangian multiplier of xl
+        self.scxI = SX.sym('scxI', self.nxi)  # Lagrangian multiplier of xi
+
+        # Box bounds for primal states
+        self.xl_lb = [-1e19] * self.nxl
+        self.xl_ub = [1e19] * self.nxl
+        self.xi_lb = [-1e19] * self.nxi
+        self.xi_ub = [1e19] * self.nxi
+
+        # Physical tension limits
         self.t_min = 0.01
-        self.t_max = 5 # the maximum tension force
-        self.scxi_lb = [-1e19,-1e19,-1e19, -1e19,-1e19,-1e19, -1e19,-1e19,-1e19, -1e19,-1e19,-1e19, self.t_min,-1e19]
-        self.scxi_ub = [1e19,1e19,1e19, 1e19,1e19,1e19, 1e19,1e19,1e19, 1e19,1e19,1e19, self.t_max, 1e19]
+        self.t_max = 5  # the maximum tension force
+
+        scxi_lb = [-1e19] * self.nxi
+        scxi_ub = [1e19] * self.nxi
+        if self.nxi >= 2:
+            tension_idx = self.nxi - 2  # second last state stores the tension magnitude
+            scxi_lb[tension_idx] = self.t_min
+            scxi_ub[tension_idx] = self.t_max
+        self.scxi_lb = scxi_lb
+        self.scxi_ub = scxi_ub
 
 
-    def SetCtrlVariables(self, ul, ui):
+    def SetCtrlVariables(self, ul, ui): # TODO: Deprecated Type 1
         self.ul    = ul
         self.ui    = ui
         self.nul   = ul.numel()
@@ -131,13 +1044,13 @@ class MPC_Planner:
         self.ui_lb = self.nui*[-self.ui_bound]
         self.ui_ub = self.nui*[self.ui_bound]
 
-    def SetDyns(self, model_l, model_i):
+    def SetDyns(self, model_l, model_i): # TODO: Deprecated Type 1
         self.model_l = self.xl + self.dt*model_l # 4th-order Runge-Kutta discrete-time load dynamics model
         self.model_i = self.xi + self.dt*model_i # 4th-order Runge-Kutta discrete-time cable dynamics model
         self.model_l_fn = Function('mdynl',[self.xl, self.ul],[self.model_l],['xl0','ul0'],['mdynlf'])
         self.model_i_fn = Function('mdyni',[self.xi, self.ui],[self.model_i],['xi0','ui0'],['mdynif'])
 
-    def SetWeightPara(self):
+    def SetWeightPara(self):# TODO: Deprecated 
         # self.nwsl    = self.nxl
         self.para_l  = SX.sym('paral',1,(2*self.nxl+self.nul+4)) # including the ADMM penalty parameter, px, pu, gammax, gammau
         self.npl     = self.para_l.numel()
@@ -146,16 +1059,33 @@ class MPC_Planner:
         self.P_auto  = horzcat(self.para_l,self.para_i)
         self.n_Pauto = self.P_auto.numel()
 
-    def Discount_rate(self,gamma,a,ADMM_max):
+    def Discount_rate(self,gamma,a,ADMM_max): # TODO Type 2
         dis = 1/(1+exp(-gamma*(a - int(ADMM_max/2))))
         return dis
+    
+    @staticmethod
+    def Discount_rate_jax(gamma, a, ADMM_max):
+        """新增的 jax 版本的基于 Sigmoid 的折扣率"""
+        # gamma: 陡峭系数, a: 当前 ADMM 迭代步, ADMM_max: 最大迭代步
+        return 1.0 / (1.0 + jnp.exp(-gamma * (a - ADMM_max / 2.0)))
 
-    def open_loop_penalty(self,rho,gamma,a,ADMM_max,b=0.5):
+    def open_loop_penalty(self,rho,gamma,a,ADMM_max,b=0.5): # TODO Type 2
         # rho_a = self.p_min + (rho - self.p_min) * 1/(1 + exp(-gamma*(a/(int(ADMM_max)-1)-b))) # iteration-dependent open-loop penalty policy
         rho_a = self.p_min + (rho - self.p_min) * 1/(1+exp(-gamma*(a - (ADMM_max-1)/2)))
         return rho_a
+    
+    @staticmethod
+    def open_loop_penalty_jax(rho, gamma, a, ADMM_max):
+        """
+        [UseThis 版特有] 随迭代次数 a 变化的动态惩罚系数
+        rho: 最终权重, gamma: 陡峭度, a: 当前迭代步, ADMM_max: 总步数
+        """
+        # 这就是一个 Sigmoid 函数，让惩罚项随迭代步数逐渐从 0 增长到 rho
+        p_min = 1e-3
+        return p_min + (rho - p_min) * 1.0 / (1.0 + jnp.exp(-gamma * (a - (ADMM_max - 1) / 2.0)))
 
-    def q_2_rotation(self, q): # from body frame to inertial frame
+    def q_2_rotation(self, q):#TODO Type2 
+         # from body frame to inertial frame
         # no normalization to avoid singularity in optimization
         q0, q1, q2, q3 = q[0], q[1], q[2], q[3] # q0 denotes a scalar while q1, q2, and q3 represent rotational axes x, y, and z, respectively
         R = vertcat(
@@ -165,12 +1095,28 @@ class MPC_Planner:
         )
         return R
     
+    @staticmethod
+    def _q_2_rotation_jax(q):
+        """新增的 jax 版本的四元数转旋转矩阵 无归一化版本以保持导数平滑"""
+        # 纯函数：给定相同的输入，永远返回相同的输出，且没有副作用。
+        q0, q1, q2, q3 = q[0], q[1], q[2], q[3]
+        return jnp.array([
+            [2*(q0**2 + q1**2)-1, 2*(q1*q2 - q0*q3), 2*(q1*q3 + q0*q2)],
+            [2*(q1*q2 + q0*q3), 2*(q0**2 + q2**2)-1, 2*(q2*q3 - q0*q1)],
+            [2*(q1*q3 - q0*q2), 2*(q2*q3 + q0*q1), 2*(q0**2 + q3**2)-1]
+        ])
     
     def vee_map(self, v):
         vect = vertcat(v[2, 1], v[0, 2], v[1, 0])
         return vect
+    
+    @staticmethod
+    def vee_map_jax(mat):
+        """新增的jax 版本的，反对称矩阵转回向量 (skew_sym 的逆运算)"""
+        # 输入 mat: [3, 3]
+        return jnp.array([mat[2, 1], mat[0, 2], mat[1, 0]])
 
-    def SetPayloadCostDyn(self,ADMM_max):
+    def SetPayloadCostDyn(self,ADMM_max):# TODO: Deprecated 
         self.ref_xl   = SX.sym('refxl',self.nxl,1)
         self.ref_ul   = SX.sym('reful',self.nul,1) 
         track_error_l = self.xl - self.ref_xl
@@ -197,7 +1143,7 @@ class MPC_Planner:
         self.Jl_P2_N_fn = Function('Jl_P2_N',[self.xl, self.scxl, self.scxL, self.para_l, self.a],[self.Jl_P2_N],['xl0', 'scxl0', 'scxL0', 'paral0', 'a0'],['Jl_P2_Nf'])
 
 
-    def SetCableCostDyn(self,ADMM_max):
+    def SetCableCostDyn(self,ADMM_max):# TODO: Deprecated 
         self.ref_xi   = SX.sym('refxi',self.nxi,1)
         self.ref_ui   = SX.sym('refui',self.nui,1)
         track_error_i = self.xi - self.ref_xi
@@ -222,7 +1168,7 @@ class MPC_Planner:
         self.Ji_P2_N  = self.pix_dis/2*self.resid_xi.T@self.resid_xi 
         self.Ji_P2_N_fn = Function('Ji_P2_N',[self.xi, self.scxi, self.scxI, self.para_i, self.a],[self.Ji_P2_N],['xi0', 'scxi0', 'scxI0', 'parai0', 'a0'],['Jl_P2_Nf'])
 
-    def Load_derivatives_DDP_ADMM(self):
+    def Load_derivatives_DDP_ADMM(self): # TODO: Type 5
         # alpha = 1
         self.Vxl      = SX.sym('Vxl',self.nxl)
         self.Vxlxl    = SX.sym('Vxlxl',self.nxl,self.nxl)
@@ -272,7 +1218,7 @@ class MPC_Planner:
 
 
     
-    def Cable_derivatives_DDP_ADMM(self):
+    def Cable_derivatives_DDP_ADMM(self): # TODO: Type 5
         self.Vxi      = SX.sym('Vxi',self.nxi)
         self.Vxixi    = SX.sym('Vxixi',self.nxi,self.nxi)
         # gradients of the system dynamics, the cost function, and the Q value function
@@ -322,7 +1268,7 @@ class MPC_Planner:
 
     
     
-    def Get_AuxSys_DDP_Load(self,opt_sol,Ref_xl,Ref_ul,scxl,scul,scxL,scuL,weight1,i_admm):
+    def Get_AuxSys_DDP_Load(self,opt_sol,Ref_xl,Ref_ul,scxl,scul,scxL,scuL,weight1,i_admm):# TODO: Type 5
         xl_opt   = opt_sol['xl_traj']
         ul_opt   = opt_sol['ul_traj']
         LxlNp    = self.lxlNp_fn(xl0=xl_opt[-1,:],refxl0=Ref_xl[self.N*self.nxl:(self.N+1)*self.nxl],scxl0=scxl[self.N*self.nxl:(self.N+1)*self.nxl],scxL0=scxL[self.N*self.nxl:(self.N+1)*self.nxl],paral0=weight1,a0=i_admm)['lxlNp_f'].full()
@@ -344,7 +1290,7 @@ class MPC_Planner:
         return auxSysl
     
 
-    def Get_AuxSys_DDP_Cable(self,opt_sol,Ref_xi,Ref_ui,scxi,scui,scxI,scuI,weight2,i_admm):
+    def Get_AuxSys_DDP_Cable(self,opt_sol,Ref_xi,Ref_ui,scxi,scui,scxI,scuI,weight2,i_admm):# TODO: Type 5
         xi_opt   = opt_sol['xi_traj']
         ui_opt   = opt_sol['ui_traj']
         LxiNp    = self.lxiNp_fn(xi0=xi_opt[-1,:],refxi0=Ref_xi[self.N*self.nxi:(self.N+1)*self.nxi],scxi0=scxi[self.N*self.nxi:(self.N+1)*self.nxi],scxI0=scxI[self.N*self.nxi:(self.N+1)*self.nxi],parai0=weight2,a0=i_admm)['lxiNp_f'].full()
@@ -385,7 +1331,7 @@ class MPC_Planner:
         raise LA.LinAlgError("Cholesky failed even with jitter")
 
    
-    def DDP_Load_ADMM_Subp1(self,xl_0,Ref_xl,Ref_ul,weight1,scxl,scul,scxL,scuL,max_iter,e_tol,i_admm):
+    def DDP_Load_ADMM_Subp1(self,xl_0,Ref_xl,Ref_ul,weight1,scxl,scul,scxL,scuL,max_iter,e_tol,i_admm):# TODO Type 4
         reg        = 1e-6 # Regularization term
         reg_max    = 1    # cap to avoid runaway
         reg_up     = 10.0 # how much to bump when ill-conditioned
@@ -540,7 +1486,7 @@ class MPC_Planner:
         return opt_sol
     
 
-    def DDP_Cable_ADMM_Subp1(self,xi_0,Ref_xi,Ref_ui,weight2,scxi,scui,scxI,scuI,max_iter,e_tol,i_admm):
+    def DDP_Cable_ADMM_Subp1(self,xi_0,Ref_xi,Ref_ui,weight2,scxi,scui,scxI,scuI,max_iter,e_tol,i_admm):# TODO Type 4
         reg          = 1e-6 # Regularization term
         reg_max      = 1    # cap to avoid runaway
         reg_up       = 10.0 # how much to bump when ill-conditioned
@@ -696,7 +1642,7 @@ class MPC_Planner:
         return opt_sol
 
 
-    def MPC_Cable_DDP_Planning_SubP1(self,ParaC): # checked, correct, Apr.1 2025
+    def MPC_Cable_DDP_Planning_SubP1(self,ParaC):#TODO Type 4 原版多机函数， 已经由jax新版替代  # checked, correct, Apr.1 2025
         xc_traj      = [np.zeros((self.N+1,self.nxi)) for _ in range(int(self.nq))]
         uc_traj      = [np.zeros((self.N,self.nui)) for _ in range(int(self.nq))]
         OPt_sol_c    = []
