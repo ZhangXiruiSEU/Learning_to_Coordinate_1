@@ -1,0 +1,2 @@
+feas,eq_inf,ineq_vio,orig_max_abs,orig_rmse,converged,finite,iterations,tau_min,mu_min,min_delta,gamma_y,gamma_z,line_search_factor,line_search_min_step_size,s0_cap,z0_init
+0.00011372566223144531,0.00011372566223144531,0.0,0.008262968974823037,0.0017770421747193947,True,True,2,0.99,1e-08,0.0001,0.0001,0.0001,0.2,1e-10,0.5,0.001

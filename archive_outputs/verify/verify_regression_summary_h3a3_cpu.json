@@ -1,0 +1,69 @@
+{
+  "task_idx": 0,
+  "horizon": 3,
+  "admm_iters": 3,
+  "diff": {
+    "load_state_xl": {
+      "max_abs": 4.5125940523276474e-05,
+      "rmse": 8.069906111035884e-06
+    },
+    "load_control_ul": {
+      "max_abs": 8.744397096105416e-05,
+      "rmse": 4.441667976957003e-05
+    },
+    "cable_state_xc": {
+      "max_abs": 0.000912394239317731,
+      "rmse": 0.00011153898176247935
+    }
+  },
+  "subp2_summary": [
+    {
+      "admm_iter": 0,
+      "mode_counts": {
+        "main": 4
+      },
+      "max_eq": 0.00010546075955386591,
+      "max_raw_ineq": 0.09205886379326805,
+      "max_tail_mu": NaN,
+      "max_tail_ineq": NaN,
+      "max_tail_comp": NaN,
+      "max_tail_dual": NaN
+    },
+    {
+      "admm_iter": 1,
+      "mode_counts": {
+        "main-soft": 4
+      },
+      "max_eq": 3.531733570416584e-05,
+      "max_raw_ineq": 0.1463095207969332,
+      "max_tail_mu": 1e-08,
+      "max_tail_ineq": 0.002526869311886858,
+      "max_tail_comp": 7.120114985843219e-12,
+      "max_tail_dual": 4.924387822155432e-05
+    },
+    {
+      "admm_iter": 2,
+      "mode_counts": {
+        "main-soft": 4
+      },
+      "max_eq": 2.219481265353096e-05,
+      "max_raw_ineq": 0.1430824907917042,
+      "max_tail_mu": 1e-08,
+      "max_tail_ineq": 0.002514502953889603,
+      "max_tail_comp": 1.3768380712029517e-12,
+      "max_tail_dual": 1.950991335797117e-05
+    }
+  ],
+  "subp2_acceptance": {
+    "soft_mu_tol": 1e-08,
+    "soft_comp_tol": 1e-08,
+    "soft_dual_tol": 5e-05,
+    "soft_eq_tol": 0.0001,
+    "soft_raw_ineq_tol": 0.2,
+    "soft_trace_ineq_tol": 0.005
+  },
+  "plots": [
+    "verify_compare_load_task_0.png",
+    "verify_compare_tension_task_0.png"
+  ]
+}

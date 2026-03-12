@@ -1,0 +1,194 @@
+[PERSISTENT-JULIA-WORKER] nthreads=20 blas_threads=1 linear_solver=mumps kkt_system=default callback=default thread_schedule=default
+Loading JAX Planner from JustWorkingOnIt.py...
+ERROR:2026-03-12 13:48:49,361:jax._src.xla_bridge:491: Jax plugin configuration error: Exception when calling jax_plugins.xla_cuda13.initialize()
+Traceback (most recent call last):
+  File "/home/mpc/miniconda3/envs/xirui/lib/python3.11/site-packages/jax/_src/xla_bridge.py", line 489, in discover_pjrt_plugins
+    plugin_module.initialize()
+  File "/home/mpc/miniconda3/envs/xirui/lib/python3.11/site-packages/jax_plugins/xla_cuda13/__init__.py", line 328, in initialize
+    _check_cuda_versions(raise_on_first_error=True)
+  File "/home/mpc/miniconda3/envs/xirui/lib/python3.11/site-packages/jax_plugins/xla_cuda13/__init__.py", line 285, in _check_cuda_versions
+    local_device_count = cuda_versions.cuda_device_count()
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: jaxlib/cuda/versions_helpers.cc:113: operation cuInit(0) failed: CUDA_ERROR_OPERATING_SYSTEM
+=============================================
+Task 0 selected. ADMM Iterations: 3
+=============================================
+Load Eccentricity (rg): [ 0.00197259 -0.01148715  0.        ]
+Loading NN from: trained_data_multiagent_meta_COM_Dyn/trained_nn_l_4_3_n.pt
+Weights generated successfully.
+rho_lx (px): 237.9048, rho_lu (pu): 458.2339
+>> Starting ORIGINAL (CasADi) ADMM Forward Calculation...
+iteration: 1 ratio= [[0.96119776]] Qu_2= 1974.6500672015914
+iteration: 2 ratio= [[0.66862538]] Qu_2= 526.6162352454355
+iteration: 3 ratio= [[2.33944806e-08]] Qu_2= 0.35518304028592873
+iteration: 4 ratio= [[1.50187962e-12]] Qu_2= 0.002837495014538249
+ADMM_iteration= 1 subprblem1_load:--- 189.82 ms ---
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+ADMM_iteration= 1 subproblem1_cables:--- 541.92 ms --- current_plx= 12.636757749202138 current_plu= 48.31660568258256 current_pix= 0.18893488373754494 current_piu= 0.0010001938398128192
+
+******************************************************************************
+This program contains Ipopt, a library for large-scale nonlinear optimization.
+ Ipopt is released as open source code under the Eclipse Public License (EPL).
+         For more information visit https://github.com/coin-or/Ipopt
+******************************************************************************
+
+subproblem2:--- 2175.84 ms ---
+iteration: 1 ratio= [[0.95372221]] Qu_2= 3014.272821929349
+iteration: 2 ratio= [[0.9991386]] Qu_2= 645.2418067363737
+iteration: 3 ratio= [[1.01546009e-09]] Qu_2= 0.00612564298268703
+ADMM_iteration= 2 subprblem1_load:--- 143.20 ms ---
+iteration: 1 ratio= [[0.99263271]] Qu_2= 5.950688819332163
+iteration: 2 ratio= [[0.99226437]] Qu_2= 5.9365731497332375
+iteration: 3 ratio= [[6.33137033e-06]] Qu_2= 0.0012068749834256295
+iteration: 1 ratio= [[0.99262949]] Qu_2= 5.949359958525991
+iteration: 2 ratio= [[0.99217597]] Qu_2= 5.9365735371513715
+iteration: 3 ratio= [[6.25931896e-06]] Qu_2= 0.00120687519975868
+iteration: 1 ratio= [[0.99263967]] Qu_2= 5.950354533779043
+iteration: 2 ratio= [[0.99332257]] Qu_2= 5.936573091712832
+iteration: 3 ratio= [[7.34249352e-06]] Qu_2= 0.0012068749131679784
+iteration: 1 ratio= [[0.99262139]] Qu_2= 5.951687121413752
+iteration: 2 ratio= [[0.99047452]] Qu_2= 5.936572823606953
+iteration: 3 ratio= [[5.13235885e-06]] Qu_2= 0.0012068748718186374
+ADMM_iteration= 2 subproblem1_cables:--- 543.79 ms --- current_plx= 118.95291695189476 current_plu= 229.1174640223831 current_pix= 1.979586544754682 current_piu= 0.0010015943947982936
+subproblem2:--- 1023.54 ms ---
+iteration: 1 ratio= [[0.93976197]] Qu_2= 3861.721450508247
+iteration: 2 ratio= [[0.99950533]] Qu_2= 930.9460268823855
+iteration: 3 ratio= [[3.18682323e-09]] Qu_2= 0.012697943388041144
+iteration: 4 ratio= [[5.19006691e-15]] Qu_2= 2.0472213568586325e-05
+ADMM_iteration= 3 subprblem1_load:--- 190.97 ms ---
+iteration: 1 ratio= [[0.99248836]] Qu_2= 6.714948614528126
+iteration: 2 ratio= [[0.97292666]] Qu_2= 6.7068644574452465
+iteration: 3 ratio= [[1.0627727e-06]] Qu_2= 0.0010501448364248407
+iteration: 1 ratio= [[0.99245986]] Qu_2= 6.708253019946242
+iteration: 2 ratio= [[0.97013845]] Qu_2= 6.706866227498493
+iteration: 3 ratio= [[9.60942106e-07]] Qu_2= 0.0010501484242026746
+iteration: 1 ratio= [[0.99249742]] Qu_2= 6.711338748615861
+iteration: 2 ratio= [[0.9743837]] Qu_2= 6.706863883864102
+iteration: 3 ratio= [[1.12488261e-06]] Qu_2= 0.001050143601862775
+iteration: 1 ratio= [[0.99242362]] Qu_2= 6.7181554717672425
+iteration: 2 ratio= [[0.96390275]] Qu_2= 6.706862836396764
+iteration: 3 ratio= [[7.89573491e-07]] Qu_2= 0.001050143380026481
+ADMM_iteration= 3 subproblem1_cables:--- 543.39 ms --- current_plx= 225.2690761545874 current_plu= 409.91832236218363 current_pix= 3.7702382057718196 current_piu= 0.0010029949497837682
+subproblem2:--- 875.07 ms ---
+>>> ORIGINAL Calculation Finished in 6241.83 ms
+>> Starting JAX ADMM Forward Calculation...
+>>> JAX Calculation Finished in 19458.18 ms
+[DIFF] load_state_xl: max_abs=2.691199e-03, rmse=2.032169e-04
+[DIFF] load_control_ul: max_abs=1.317809e-03, rmse=1.542692e-04
+[DIFF] cable_state_xc: max_abs=6.985567e-03, rmse=4.944731e-04
+[SUBP2] summary:
+[SUBP2] admm_iter=0 | modes=main:101 | max_eq=nan | max_raw_ineq=nan | batch_build_ms_total=0.000 | batch_solve_ms_total=176073.363 | batch_total_ms=9088.118 | bridge_prepare_ms=288.792 | bridge_payload_ms=1.875 | bridge_request_ms=13621.735 | bridge_rebuild_ms=141.560 | max_tail_mu=nan | max_tail_ineq=nan | max_tail_comp=nan | max_tail_dual=nan
+[SUBP2] admm_iter=1 | modes=main:101 | max_eq=nan | max_raw_ineq=nan | batch_build_ms_total=0.000 | batch_solve_ms_total=4196.435 | batch_total_ms=239.539 | bridge_prepare_ms=2.394 | bridge_payload_ms=0.784 | bridge_request_ms=253.071 | bridge_rebuild_ms=1.337 | max_tail_mu=nan | max_tail_ineq=nan | max_tail_comp=nan | max_tail_dual=nan
+[SUBP2] admm_iter=2 | modes=main:101 | max_eq=nan | max_raw_ineq=nan | batch_build_ms_total=0.000 | batch_solve_ms_total=5336.569 | batch_total_ms=297.259 | bridge_prepare_ms=2.451 | bridge_payload_ms=0.681 | bridge_request_ms=309.357 | bridge_rebuild_ms=1.404 | max_tail_mu=nan | max_tail_ineq=nan | max_tail_comp=nan | max_tail_dual=nan
+Plot saved to verify_compare_load_task_0.png
+Plot saved to verify_compare_tension_task_0.png
+[PERSISTENT-JULIA-FULLFLOW] repeat=1 total_ms=26527.151
+[PERSISTENT-JULIA-SUBP2-PREPARE] repeat=1 total_ms=0.000
+[PERSISTENT-JULIA-SUBP2-BUILD] repeat=1 total_ms=0.000
+[PERSISTENT-JULIA-SUBP2-SOLVE] repeat=1 total_ms=185606.367
+[PERSISTENT-JULIA-SUBP2-ONLY] repeat=1 total_ms=9624.916
+[PERSISTENT-JULIA-BRIDGE-PREPARE] repeat=1 total_ms=293.636
+[PERSISTENT-JULIA-BRIDGE-PAYLOAD] repeat=1 total_ms=3.340
+[PERSISTENT-JULIA-BRIDGE-WORKER-PREPARE] repeat=1 total_ms=0.000
+[PERSISTENT-JULIA-BRIDGE-REQUEST] repeat=1 total_ms=14184.163
+[PERSISTENT-JULIA-BRIDGE-REBUILD] repeat=1 total_ms=144.302
+{'task_idx': 0, 'horizon': 100, 'admm_iters': 3, 'jax_profile': {'init_ms': 959.1817855834961, 'total_ms': 19458.14847946167, 'iters': [{'admm_iter': 0, 'subp1_ms': 3591.1059379577637, 'subp2_ms': 14054.654598236084, 'subp3_ms': 165.10891914367676, 'iter_total_ms': 17810.87350845337}, {'admm_iter': 1, 'subp1_ms': 54.46767807006836, 'subp2_ms': 258.3329677581787, 'subp3_ms': 1.1529922485351562, 'iter_total_ms': 313.95721435546875}, {'admm_iter': 2, 'subp1_ms': 59.26871299743652, 'subp2_ms': 314.5325183868408, 'subp3_ms': 0.324249267578125, 'iter_total_ms': 374.1295337677002}]}, 'diff': {'load_state_xl': {'max_abs': 0.0026911991094673046, 'rmse': 0.00020321686637284636}, 'load_control_ul': {'max_abs': 0.0013178093788559497, 'rmse': 0.00015426919522519168}, 'cable_state_xc': {'max_abs': 0.0069855668802756695, 'rmse': 0.0004944730933518658}}, 'subp2_summary': [{'admm_iter': 0, 'mode_counts': {'main': 101}, 'max_eq': nan, 'max_raw_ineq': nan, 'max_tail_mu': nan, 'max_tail_ineq': nan, 'max_tail_comp': nan, 'max_tail_dual': nan, 'batch_total_ms': 9088.118172, 'batch_build_ms_total': 0.0, 'batch_solve_ms_total': 176073.363391, 'bridge_prepare_ms': 288.79180300282314, 'bridge_payload_ms': 1.8747639987850562, 'bridge_request_ms': 13621.735079002974, 'bridge_rebuild_ms': 141.55975899484474}, {'admm_iter': 1, 'mode_counts': {'main': 101}, 'max_eq': nan, 'max_raw_ineq': nan, 'max_tail_mu': nan, 'max_tail_ineq': nan, 'max_tail_comp': nan, 'max_tail_dual': nan, 'batch_total_ms': 239.53897, 'batch_build_ms_total': 0.0, 'batch_solve_ms_total': 4196.435163, 'bridge_prepare_ms': 2.3935409990372136, 'bridge_payload_ms': 0.7839570025680587, 'bridge_request_ms': 253.070974998991, 'bridge_rebuild_ms': 1.3374570044106804}, {'admm_iter': 2, 'mode_counts': {'main': 101}, 'max_eq': nan, 'max_raw_ineq': nan, 'max_tail_mu': nan, 'max_tail_ineq': nan, 'max_tail_comp': nan, 'max_tail_dual': nan, 'batch_total_ms': 297.258557, 'batch_build_ms_total': 0.0, 'batch_solve_ms_total': 5336.568564, 'bridge_prepare_ms': 2.45087099756347, 'bridge_payload_ms': 0.6808120015193708, 'bridge_request_ms': 309.3568740005139, 'bridge_rebuild_ms': 1.4043960036360659}], 'subp2_acceptance': {'soft_mu_tol': 1e-08, 'soft_comp_tol': 1e-08, 'soft_dual_tol': 5e-05, 'soft_eq_tol': 0.0001, 'soft_raw_ineq_tol': 0.2, 'soft_trace_ineq_tol': 0.005}, 'plots': ['verify_compare_load_task_0.png', 'verify_compare_tension_task_0.png']}
+Loading JAX Planner from JustWorkingOnIt.py...
+=============================================
+Task 0 selected. ADMM Iterations: 3
+=============================================
+Load Eccentricity (rg): [ 0.00197259 -0.01148715  0.        ]
+Loading NN from: trained_data_multiagent_meta_COM_Dyn/trained_nn_l_4_3_n.pt
+Weights generated successfully.
+rho_lx (px): 237.9048, rho_lu (pu): 458.2339
+>> Starting ORIGINAL (CasADi) ADMM Forward Calculation...
+iteration: 1 ratio= [[0.96119776]] Qu_2= 1974.6500672015914
+iteration: 2 ratio= [[0.66862538]] Qu_2= 526.6162352454355
+iteration: 3 ratio= [[2.33944806e-08]] Qu_2= 0.35518304028592873
+iteration: 4 ratio= [[1.50187962e-12]] Qu_2= 0.002837495014538249
+ADMM_iteration= 1 subprblem1_load:--- 182.34 ms ---
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+iteration: 1 ratio= [[0.99248441]] Qu_2= 5.328664134896471
+iteration: 2 ratio= [[0.97293717]] Qu_2= 5.0156980873840595
+iteration: 3 ratio= [[3.61154722e-06]] Qu_2= 0.0014661698721386584
+ADMM_iteration= 1 subproblem1_cables:--- 519.60 ms --- current_plx= 12.636757749202138 current_plu= 48.31660568258256 current_pix= 0.18893488373754494 current_piu= 0.0010001938398128192
+subproblem2:--- 1977.92 ms ---
+iteration: 1 ratio= [[0.95372221]] Qu_2= 3014.272821929349
+iteration: 2 ratio= [[0.9991386]] Qu_2= 645.2418067363737
+iteration: 3 ratio= [[1.01546009e-09]] Qu_2= 0.00612564298268703
+ADMM_iteration= 2 subprblem1_load:--- 145.94 ms ---
+iteration: 1 ratio= [[0.99263271]] Qu_2= 5.950688819332163
+iteration: 2 ratio= [[0.99226437]] Qu_2= 5.9365731497332375
+iteration: 3 ratio= [[6.33137033e-06]] Qu_2= 0.0012068749834256295
+iteration: 1 ratio= [[0.99262949]] Qu_2= 5.949359958525991
+iteration: 2 ratio= [[0.99217597]] Qu_2= 5.9365735371513715
+iteration: 3 ratio= [[6.25931896e-06]] Qu_2= 0.00120687519975868
+iteration: 1 ratio= [[0.99263967]] Qu_2= 5.950354533779043
+iteration: 2 ratio= [[0.99332257]] Qu_2= 5.936573091712832
+iteration: 3 ratio= [[7.34249352e-06]] Qu_2= 0.0012068749131679784
+iteration: 1 ratio= [[0.99262139]] Qu_2= 5.951687121413752
+iteration: 2 ratio= [[0.99047452]] Qu_2= 5.936572823606953
+iteration: 3 ratio= [[5.13235885e-06]] Qu_2= 0.0012068748718186374
+ADMM_iteration= 2 subproblem1_cables:--- 548.72 ms --- current_plx= 118.95291695189476 current_plu= 229.1174640223831 current_pix= 1.979586544754682 current_piu= 0.0010015943947982936
+subproblem2:--- 928.73 ms ---
+iteration: 1 ratio= [[0.93976197]] Qu_2= 3861.721450508247
+iteration: 2 ratio= [[0.99950533]] Qu_2= 930.9460268823855
+iteration: 3 ratio= [[3.18682323e-09]] Qu_2= 0.012697943388041144
+iteration: 4 ratio= [[5.19006691e-15]] Qu_2= 2.0472213568586325e-05
+ADMM_iteration= 3 subprblem1_load:--- 187.60 ms ---
+iteration: 1 ratio= [[0.99248836]] Qu_2= 6.714948614528126
+iteration: 2 ratio= [[0.97292666]] Qu_2= 6.7068644574452465
+iteration: 3 ratio= [[1.0627727e-06]] Qu_2= 0.0010501448364248407
+iteration: 1 ratio= [[0.99245986]] Qu_2= 6.708253019946242
+iteration: 2 ratio= [[0.97013845]] Qu_2= 6.706866227498493
+iteration: 3 ratio= [[9.60942106e-07]] Qu_2= 0.0010501484242026746
+iteration: 1 ratio= [[0.99249742]] Qu_2= 6.711338748615861
+iteration: 2 ratio= [[0.9743837]] Qu_2= 6.706863883864102
+iteration: 3 ratio= [[1.12488261e-06]] Qu_2= 0.001050143601862775
+iteration: 1 ratio= [[0.99242362]] Qu_2= 6.7181554717672425
+iteration: 2 ratio= [[0.96390275]] Qu_2= 6.706862836396764
+iteration: 3 ratio= [[7.89573491e-07]] Qu_2= 0.001050143380026481
+ADMM_iteration= 3 subproblem1_cables:--- 532.52 ms --- current_plx= 225.2690761545874 current_plu= 409.91832236218363 current_pix= 3.7702382057718196 current_piu= 0.0010029949497837682
+subproblem2:--- 809.84 ms ---
+>>> ORIGINAL Calculation Finished in 5846.29 ms
+>> Starting JAX ADMM Forward Calculation...
+>>> JAX Calculation Finished in 1078.02 ms
+[DIFF] load_state_xl: max_abs=2.691199e-03, rmse=2.032169e-04
+[DIFF] load_control_ul: max_abs=1.317809e-03, rmse=1.542692e-04
+[DIFF] cable_state_xc: max_abs=6.985567e-03, rmse=4.944731e-04
+[SUBP2] summary:
+[SUBP2] admm_iter=0 | modes=main:101 | max_eq=nan | max_raw_ineq=nan | batch_build_ms_total=0.000 | batch_solve_ms_total=5507.363 | batch_total_ms=320.201 | bridge_prepare_ms=2.768 | bridge_payload_ms=1.495 | bridge_request_ms=329.176 | bridge_rebuild_ms=1.367 | max_tail_mu=nan | max_tail_ineq=nan | max_tail_comp=nan | max_tail_dual=nan
+[SUBP2] admm_iter=1 | modes=main:101 | max_eq=nan | max_raw_ineq=nan | batch_build_ms_total=0.000 | batch_solve_ms_total=3894.158 | batch_total_ms=243.203 | bridge_prepare_ms=2.400 | bridge_payload_ms=0.620 | bridge_request_ms=256.728 | bridge_rebuild_ms=1.367 | max_tail_mu=nan | max_tail_ineq=nan | max_tail_comp=nan | max_tail_dual=nan
+[SUBP2] admm_iter=2 | modes=main:101 | max_eq=nan | max_raw_ineq=nan | batch_build_ms_total=0.000 | batch_solve_ms_total=4472.752 | batch_total_ms=248.304 | bridge_prepare_ms=2.444 | bridge_payload_ms=0.630 | bridge_request_ms=260.961 | bridge_rebuild_ms=1.342 | max_tail_mu=nan | max_tail_ineq=nan | max_tail_comp=nan | max_tail_dual=nan
+Plot saved to verify_compare_load_task_0.png
+Plot saved to verify_compare_tension_task_0.png
+[PERSISTENT-JULIA-FULLFLOW] repeat=2 total_ms=7275.913
+[PERSISTENT-JULIA-SUBP2-PREPARE] repeat=2 total_ms=0.000
+[PERSISTENT-JULIA-SUBP2-BUILD] repeat=2 total_ms=0.000
+[PERSISTENT-JULIA-SUBP2-SOLVE] repeat=2 total_ms=13874.273
+[PERSISTENT-JULIA-SUBP2-ONLY] repeat=2 total_ms=811.709
+[PERSISTENT-JULIA-BRIDGE-PREPARE] repeat=2 total_ms=7.612
+[PERSISTENT-JULIA-BRIDGE-PAYLOAD] repeat=2 total_ms=2.746
+[PERSISTENT-JULIA-BRIDGE-WORKER-PREPARE] repeat=2 total_ms=0.000
+[PERSISTENT-JULIA-BRIDGE-REQUEST] repeat=2 total_ms=846.865
+[PERSISTENT-JULIA-BRIDGE-REBUILD] repeat=2 total_ms=4.076
+{'task_idx': 0, 'horizon': 100, 'admm_iters': 3, 'jax_profile': {'init_ms': 44.69609260559082, 'total_ms': 1077.9938697814941, 'iters': [{'admm_iter': 0, 'subp1_ms': 61.568260192871094, 'subp2_ms': 335.51955223083496, 'subp3_ms': 0.3483295440673828, 'iter_total_ms': 397.44019508361816}, {'admm_iter': 1, 'subp1_ms': 55.315494537353516, 'subp2_ms': 261.8756294250488, 'subp3_ms': 1.031637191772461, 'iter_total_ms': 318.22705268859863}, {'admm_iter': 2, 'subp1_ms': 51.11193656921387, 'subp2_ms': 266.096830368042, 'subp3_ms': 0.4096031188964844, 'iter_total_ms': 317.62242317199707}]}, 'diff': {'load_state_xl': {'max_abs': 0.0026911991062328793, 'rmse': 0.00020321686764015367}, 'load_control_ul': {'max_abs': 0.0013178093543071423, 'rmse': 0.00015426919477242286}, 'cable_state_xc': {'max_abs': 0.006985566867543474, 'rmse': 0.0004944730943844424}}, 'subp2_summary': [{'admm_iter': 0, 'mode_counts': {'main': 101}, 'max_eq': nan, 'max_raw_ineq': nan, 'max_tail_mu': nan, 'max_tail_ineq': nan, 'max_tail_comp': nan, 'max_tail_dual': nan, 'batch_total_ms': 320.201392, 'batch_build_ms_total': 0.0, 'batch_solve_ms_total': 5507.363203, 'bridge_prepare_ms': 2.7675309975165874, 'bridge_payload_ms': 1.494950003689155, 'bridge_request_ms': 329.17555599851767, 'bridge_rebuild_ms': 1.367408003716264}, {'admm_iter': 1, 'mode_counts': {'main': 101}, 'max_eq': nan, 'max_raw_ineq': nan, 'max_tail_mu': nan, 'max_tail_ineq': nan, 'max_tail_comp': nan, 'max_tail_dual': nan, 'batch_total_ms': 243.203172, 'batch_build_ms_total': 0.0, 'batch_solve_ms_total': 3894.1576110000005, 'bridge_prepare_ms': 2.400429002591409, 'bridge_payload_ms': 0.6203740049386397, 'bridge_request_ms': 256.72832100099185, 'bridge_rebuild_ms': 1.3672679997398518}, {'admm_iter': 2, 'mode_counts': {'main': 101}, 'max_eq': nan, 'max_raw_ineq': nan, 'max_tail_mu': nan, 'max_tail_ineq': nan, 'max_tail_comp': nan, 'max_tail_dual': nan, 'batch_total_ms': 248.303941, 'batch_build_ms_total': 0.0, 'batch_solve_ms_total': 4472.751972999999, 'bridge_prepare_ms': 2.4443329966743477, 'bridge_payload_ms': 0.6304720009211451, 'bridge_request_ms': 260.9612449959968, 'bridge_rebuild_ms': 1.3416380024864338}], 'subp2_acceptance': {'soft_mu_tol': 1e-08, 'soft_comp_tol': 1e-08, 'soft_dual_tol': 5e-05, 'soft_eq_tol': 0.0001, 'soft_raw_ineq_tol': 0.2, 'soft_trace_ineq_tol': 0.005}, 'plots': ['verify_compare_load_task_0.png', 'verify_compare_tension_task_0.png']}

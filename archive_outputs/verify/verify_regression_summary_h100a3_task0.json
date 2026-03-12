@@ -1,0 +1,72 @@
+{
+  "task_idx": 0,
+  "horizon": 100,
+  "admm_iters": 3,
+  "diff": {
+    "load_state_xl": {
+      "max_abs": 0.0023292529140978716,
+      "rmse": 0.0002244464145319971
+    },
+    "load_control_ul": {
+      "max_abs": 0.0012280136283893128,
+      "rmse": 0.00020753024825969764
+    },
+    "cable_state_xc": {
+      "max_abs": 0.007749464834627819,
+      "rmse": 0.0006900272514495914
+    }
+  },
+  "subp2_summary": [
+    {
+      "admm_iter": 0,
+      "mode_counts": {
+        "main": 95,
+        "best-feas": 6
+      },
+      "max_eq": 0.00021125988025016973,
+      "max_raw_ineq": 0.12513797323654596,
+      "max_tail_mu": 1e-08,
+      "max_tail_ineq": 0.0022119894837293584,
+      "max_tail_comp": 1.0068658679478793e-08,
+      "max_tail_dual": 0.0013287595097639729
+    },
+    {
+      "admm_iter": 1,
+      "mode_counts": {
+        "main-soft": 73,
+        "best-feas": 28
+      },
+      "max_eq": 3.503936705473443e-05,
+      "max_raw_ineq": 0.2114746448244108,
+      "max_tail_mu": 1e-08,
+      "max_tail_ineq": 0.0035236042188096753,
+      "max_tail_comp": 4.7497869962858265e-05,
+      "max_tail_dual": 0.00039312234082293594
+    },
+    {
+      "admm_iter": 2,
+      "mode_counts": {
+        "main-soft": 92,
+        "best-feas": 9
+      },
+      "max_eq": 2.228872208998034e-05,
+      "max_raw_ineq": 0.21046039072182857,
+      "max_tail_mu": 1e-08,
+      "max_tail_ineq": 0.003408550242029601,
+      "max_tail_comp": 1.9689846176982635e-09,
+      "max_tail_dual": 2.100179583960633e-05
+    }
+  ],
+  "subp2_acceptance": {
+    "soft_mu_tol": 1e-08,
+    "soft_comp_tol": 1e-08,
+    "soft_dual_tol": 5e-05,
+    "soft_eq_tol": 0.0001,
+    "soft_raw_ineq_tol": 0.2,
+    "soft_trace_ineq_tol": 0.005
+  },
+  "plots": [
+    "verify_compare_load_task_0.png",
+    "verify_compare_tension_task_0.png"
+  ]
+}
