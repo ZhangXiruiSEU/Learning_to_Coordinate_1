@@ -20,12 +20,12 @@ import JustWorkingOnIt as JAX_Planner
 import verify_jax_vs_original
 
 # -----------------------------------------------------------------------------
-# 这个文件不是 Julia 求解器本体，而是当前稳定 persistent Julia 路线的 Python 侧总控。
+# 当前稳定 persistent Julia 路线的 Python 侧总控。
 #
-# 它主要做四件事：
+# 主要做四件事：
 # 1. 启动一个常驻 Julia worker 进程
 # 2. 把 JustWorkingOnIt.py 里的 jax_ADMM_SubP2 临时替换成 Julia IPC 版本
-# 3. 在 Python 侧完成 SubP2 batch payload 的打包与结果解包
+# 3. 在上述的 IPC 版本 Python 函数中，完成 SubP2 batch payload 的打包与结果解包
 # 4. 跑 fullflow verify / benchmark，并汇总桥接和求解时间
 #
 # 如果你现在只关心"当前正式主线"，最小阅读顺序建议是：
@@ -34,6 +34,11 @@ import verify_jax_vs_original
 # 3. install_julia_subp2_patch(...)
 # 4. run_once(...)
 # 5. main()
+#
+# 文件也按这个顺序重排过：
+# - 主线直接会走的定义尽量靠前
+# - 旧 snapshot/export helper 放到文件尾部
+# - JuliaBatchWorker 里非主线文件模式/prepare 模式方法放到类尾部
 #
 # 当前主线里可先跳过的部分：
 # - build_step_export(...)
@@ -123,51 +128,6 @@ def _to_jsonable(obj):
 # 把 Julia 回包里的指标数组安全转成 numpy，并把 null 统一映射成 NaN。
 def _json_metric_array(values):
     return np.asarray([np.nan if v is None else float(v) for v in values], dtype=float)
-
-
-# 可先跳过：单步完整 snapshot 导出 helper。
-# 它会把 init/original 两套参考值都带上，适合离线单步核对；
-# 当前 persistent Julia fullflow runner 并不直接调用它。
-def build_step_export(planner, dims, x_init, x_orig, params_t, meta):
-    eq_init = np.array(planner.ipoptax_equality(x_init, params_t, dims), dtype=float)
-    ineq_init = np.array(planner.ipoptax_inequality(x_init, params_t, dims), dtype=float)
-    eq_orig = np.array(planner.ipoptax_equality(x_orig, params_t, dims), dtype=float)
-    ineq_orig = np.array(planner.ipoptax_inequality(x_orig, params_t, dims), dtype=float)
-    export = {
-        "meta": meta,
-        "step": {
-            "dims": list(map(int, dims)),
-            "x_init": np.array(x_init, dtype=float),
-            "params_t": {k: np.array(v) for k, v in params_t.items()},
-            "init_reference_values": {
-                "objective": float(np.array(planner.ipoptax_objective(x_init, params_t, dims))),
-                "eq_vec": eq_init,
-                "ineq_vec": ineq_init,
-            },
-            "original_step_reference": np.array(x_orig, dtype=float),
-            "original_reference_values": {
-                "objective": float(np.array(planner.ipoptax_objective(x_orig, params_t, dims))),
-                "eq_vec": eq_orig,
-                "ineq_vec": ineq_orig,
-            },
-        },
-    }
-    return _to_jsonable(export)
-
-
-# 可先跳过：单步 runtime 导出 helper。
-# 相比上面的完整 snapshot 更轻，但当前这个 batch runner 也不直接走它。
-def build_step_export_runtime(dims, x_init, params_t, meta):
-    export = {
-        "meta": meta,
-        "step": {
-            "dims": list(map(int, dims)),
-            "x_init": np.array(x_init, dtype=float),
-            "params_t": {k: np.array(v) for k, v in params_t.items()},
-        },
-    }
-    return _to_jsonable(export)
-
 
 # 当前稳定主线直接会走这里。
 # 作用：把 planner 侧的 batch 决策变量和运行期参数裁剪、搬到 host，再打成 Julia worker 能直接消费的紧凑 payload。
@@ -259,37 +219,6 @@ class JuliaBatchWorker:
             raise RuntimeError(f"Julia worker error: {resp}")
         return resp
 
-    # 可先跳过：文件路径模式。
-    # 只有 keep_json=True 时才会先把 payload 写到磁盘，再让 Julia 读文件。
-    # 当前稳定主线默认不走这条。
-    def solve_batch(self, in_path, args):
-        return self._request(
-            {
-                "action": "solve_batch",
-                "in_path": str(in_path),
-                "max_iter": int(args.max_iter),
-                "acceptable_tol": float(args.acceptable_tol),
-                "acceptable_iter": int(args.acceptable_iter),
-                "tol": float(args.tol),
-                "runtime_metric_mode": str(args.julia_runtime_metrics),
-                "result_format": JULIA_STACKED_RESULT_FORMAT,
-            }
-        )["result"]
-
-    # 可先跳过：prepare_batch 预热/诊断接口。
-    # 当前正式 benchmark 主线没有调用它，保留它主要是给实验和潜在预构建路径用。
-    def prepare_batch_payload(self, payload, args):
-        return self._request(
-            {
-                "action": "prepare_batch",
-                "payload": payload,
-                "max_iter": int(args.max_iter),
-                "acceptable_tol": float(args.acceptable_tol),
-                "acceptable_iter": int(args.acceptable_iter),
-                "tol": float(args.tol),
-            }
-        )["result"]
-
     # 当前稳定主线直接走这里。
     # Python 直接把内存里的 batch payload 发给 Julia worker，不落盘。
     def solve_batch_payload(self, payload, args):
@@ -322,6 +251,42 @@ class JuliaBatchWorker:
                 self.proc.kill()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # 以下两个方法不是当前稳定主线必经路径，统一放到类尾部。
+    # 主线默认是 solve_batch_payload(...)；只有兼容/实验模式才会走这里。
+    # ------------------------------------------------------------------
+
+    # 可先跳过：文件路径模式。
+    # 只有 keep_json=True 时才会先把 payload 写到磁盘，再让 Julia 读文件。
+    # 当前稳定主线默认不走这条。
+    def solve_batch(self, in_path, args):
+        return self._request(
+            {
+                "action": "solve_batch",
+                "in_path": str(in_path),
+                "max_iter": int(args.max_iter),
+                "acceptable_tol": float(args.acceptable_tol),
+                "acceptable_iter": int(args.acceptable_iter),
+                "tol": float(args.tol),
+                "runtime_metric_mode": str(args.julia_runtime_metrics),
+                "result_format": JULIA_STACKED_RESULT_FORMAT,
+            }
+        )["result"]
+
+    # 可先跳过：prepare_batch 预热/诊断接口。
+    # 当前正式 benchmark 主线没有调用它，保留它主要是给实验和潜在预构建路径用。
+    def prepare_batch_payload(self, payload, args):
+        return self._request(
+            {
+                "action": "prepare_batch",
+                "payload": payload,
+                "max_iter": int(args.max_iter),
+                "acceptable_tol": float(args.acceptable_tol),
+                "acceptable_iter": int(args.acceptable_iter),
+                "tol": float(args.tol),
+            }
+        )["result"]
 
 
 # 当前稳定主线的关键接缝。
@@ -495,7 +460,7 @@ def run_once(args, worker):
 
 
 # CLI 主入口。
-# 当前你从命令行跑 persistent Julia fullflow 时，实际就是从这里启动。
+# 当前从命令行跑 persistent Julia fullflow 时，实际就是从这里启动。
 def main():
     args = build_parser().parse_args()
     worker = JuliaBatchWorker(
@@ -533,6 +498,55 @@ def main():
             print(out["summary"])
     finally:
         worker.close()
+
+
+# -----------------------------------------------------------------------------
+# 以下 helper 不是当前稳定 fullflow 主线必经路径，统一收在文件尾部。
+# 保留它们是为了离线单步核对/兼容旧实验，不影响主线执行逻辑。
+# -----------------------------------------------------------------------------
+
+# 可先跳过：单步完整 snapshot 导出 helper。
+# 它会把 init/original 两套参考值都带上，适合离线单步核对；
+# 当前 persistent Julia fullflow runner 并不直接调用它。
+def build_step_export(planner, dims, x_init, x_orig, params_t, meta):
+    eq_init = np.array(planner.ipoptax_equality(x_init, params_t, dims), dtype=float)
+    ineq_init = np.array(planner.ipoptax_inequality(x_init, params_t, dims), dtype=float)
+    eq_orig = np.array(planner.ipoptax_equality(x_orig, params_t, dims), dtype=float)
+    ineq_orig = np.array(planner.ipoptax_inequality(x_orig, params_t, dims), dtype=float)
+    export = {
+        "meta": meta,
+        "step": {
+            "dims": list(map(int, dims)),
+            "x_init": np.array(x_init, dtype=float),
+            "params_t": {k: np.array(v) for k, v in params_t.items()},
+            "init_reference_values": {
+                "objective": float(np.array(planner.ipoptax_objective(x_init, params_t, dims))),
+                "eq_vec": eq_init,
+                "ineq_vec": ineq_init,
+            },
+            "original_step_reference": np.array(x_orig, dtype=float),
+            "original_reference_values": {
+                "objective": float(np.array(planner.ipoptax_objective(x_orig, params_t, dims))),
+                "eq_vec": eq_orig,
+                "ineq_vec": ineq_orig,
+            },
+        },
+    }
+    return _to_jsonable(export)
+
+
+# 可先跳过：单步 runtime 导出 helper。
+# 相比上面的完整 snapshot 更轻，但当前这个 batch runner 也不直接走它。
+def build_step_export_runtime(dims, x_init, params_t, meta):
+    export = {
+        "meta": meta,
+        "step": {
+            "dims": list(map(int, dims)),
+            "x_init": np.array(x_init, dtype=float),
+            "params_t": {k: np.array(v) for k, v in params_t.items()},
+        },
+    }
+    return _to_jsonable(export)
 
 
 # 作为脚本直接执行时，从 main() 进入。

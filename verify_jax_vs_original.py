@@ -24,8 +24,8 @@ import Neural_network # 必须有这个文件来加载模型类 # Required for t
 
 def _reexec_with_backend_fallback():
     """
-    默认使用 CPU；可选尝试 Apple Metal（通过环境变量开启）。
-    通过子进程执行，避免 METAL 后端初始化失败导致当前进程直接崩溃。
+    默认使用 CPU。
+    通过子进程执行，避免后端选择在当前进程里留下脏状态。
     """
     if os.environ.get("VERIFY_JAX_BACKEND_SELECTED") == "1":
         return
@@ -33,27 +33,13 @@ def _reexec_with_backend_fallback():
     script = os.path.abspath(__file__)
     argv = [sys.executable, script] + sys.argv[1:]
 
-    # 默认 CPU
+    # 默认直接重启到 CPU 后端。
     env_cpu = os.environ.copy()
     env_cpu["VERIFY_JAX_BACKEND_SELECTED"] = "1"
     env_cpu["JAX_PLATFORMS"] = "cpu"
-    if os.environ.get("VERIFY_JAX_TRY_METAL", "0") != "1":
-        print("Using JAX backend: CPU")
-        rc = subprocess.run(argv, env=env_cpu).returncode
-        sys.exit(rc)
-
-    # 可选先试 METAL，再回退 CPU
-    env_metal = os.environ.copy()
-    env_metal["VERIFY_JAX_BACKEND_SELECTED"] = "1"
-    env_metal["JAX_PLATFORMS"] = "METAL"
-    print("Trying JAX backend: METAL")
-    rc = subprocess.run(argv, env=env_metal).returncode
-    if rc == 0:
-        sys.exit(0)
-
-    print(f"METAL failed with code {rc}, falling back to CPU...")
-    rc2 = subprocess.run(argv, env=env_cpu).returncode
-    sys.exit(rc2)
+    print("Using JAX backend: CPU")
+    rc = subprocess.run(argv, env=env_cpu).returncode
+    sys.exit(rc)
 
 def _resolve_task_idx(task_idx=None):
     if task_idx is not None:
@@ -76,6 +62,117 @@ def _safe_nanmax(values):
     if arr.size == 0 or np.all(np.isnan(arr)):
         return float("nan")
     return float(np.nanmax(arr))
+
+
+# 当前新路线初始化单独封装。
+# 这里只负责把 JAX planner（以及可能被 monkey-patch 的 Julia SubP2 主线）初始化好，
+# 不掺杂原版 CasADi planner 的构造逻辑。
+def _init_jax_planner_case(JAX_Planner, sysm_para, dt, horizon, pob1, pob2, rg_task_val):
+    print("Loading JAX Planner from JustWorkingOnIt.py...")
+    MPC_jax = JAX_Planner.MPC_Planner(sysm_para, dt, horizon)
+    MPC_jax.verbose = os.environ.get("VERIFY_JAX_VERBOSE", "0") == "1"
+    MPC_jax.pob1 = np.array([pob1[0, 0], pob1[1, 0], 0.0])
+    MPC_jax.pob2 = np.array([pob2[0, 0], pob2[1, 0], 0.0])
+    MPC_jax.rg = rg_task_val
+    MPC_jax.allocation_martrix(rg_task_val)
+    return MPC_jax
+
+
+# 原版 CasADi/IPOPT 初始化单独封装。
+# 返回 sysm + MPC_orig：
+# - sysm 负责原版 minisnap/reference 生成和符号动力学
+# - MPC_orig 是真正跑 legacy ADMM forward 的 planner
+def _init_original_planner_case(sysm_para, dt, horizon, pob1, pob2, rp_task_val, rg_task_val, max_iter_ADMM):
+    sysm = Original_Dyn.multilift_model(sysm_para, dt)
+    sysm.Rotational_Inertia(rp_task_val)
+    sysm.model()
+
+    MPC_orig = Original_Planner.MPC_Planner(sysm_para, dt, horizon)
+    MPC_orig.Rotational_Inertia(rp_task_val)
+    MPC_orig.allocation_martrix(rg_task_val)
+    MPC_orig.SetStateVariables(sysm.xl, sysm.xi)
+    MPC_orig.SetCtrlVariables(sysm.ul, sysm.ui)
+    MPC_orig.SetDyns(sysm.model_l, sysm.model_i)
+    MPC_orig.SetWeightPara()
+    MPC_orig.SetPayloadCostDyn(max_iter_ADMM)
+    MPC_orig.SetCableCostDyn(max_iter_ADMM)
+    MPC_orig.SetConstriants(pob1, pob2)
+    MPC_orig.SetADMMSubP2_SoftCost_k()
+    MPC_orig.SetADMMSubP2_SoftCost_N()
+    MPC_orig.ADMM_SubP2_Init()
+    MPC_orig.ADMM_SubP2_N_Init()
+    MPC_orig.Load_derivatives_DDP_ADMM()
+    MPC_orig.Cable_derivatives_DDP_ADMM()
+    MPC_orig.system_derivatives_SubP2_ADMM_k()
+    MPC_orig.system_derivatives_SubP2_ADMM_N()
+    MPC_orig.system_derivatives_SubP3_ADMM()
+    return sysm, MPC_orig
+
+
+# 旧版 CasADi/IPOPT 主线单独封装。
+# verify_jax_planner 本质上就是：同一组输入，先跑原版，再跑当前 JAX/Julia 路线。
+# 把这段拆出来后，旧版和新版的执行边界就更清楚了。
+def _run_original_planner_case(
+    MPC_orig,
+    Ref_xl_flat,
+    Ref_ul_flat,
+    ref_xq_list,
+    ref_uq_single,
+    xl_init_task,
+    xq_init_list,
+    P_weight1,
+    P_weight2,
+    max_iter_ADMM,
+):
+    print(">> Starting ORIGINAL (CasADi) ADMM Forward Calculation...")
+    start_time = TM.time()
+    opt_sol_orig, *_ = MPC_orig.ADMM_forward_MPC(
+        Ref_xl=Ref_xl_flat,
+        Ref_ul=Ref_ul_flat,
+        ref_xq=ref_xq_list,
+        ref_uq=ref_uq_single,
+        xl_fb=xl_init_task,
+        xq_fb=np.concatenate(xq_init_list),
+        paral=P_weight1,
+        paraC=P_weight2,
+        max_iter_ADMM=max_iter_ADMM
+    )
+    elapsed_ms = (TM.time() - start_time) * 1000.0
+    print(f">>> ORIGINAL Calculation Finished in {elapsed_ms:.2f} ms")
+    return opt_sol_orig, elapsed_ms
+
+
+# 当前 JAX 主线单独封装。
+# 注意：这里调用的 jax_ADMM_forward_MPC 可能会被外部 runner monkey-patch 成
+# persistent Julia SubP2 版本，所以这个函数代表的是“当前新路线”，不一定是纯 JAX SubP2。
+def _run_jax_planner_case(
+    MPC_jax,
+    Ref_xl_flat,
+    Ref_ul_flat,
+    ref_xq_list,
+    ref_uq_single,
+    xl_init_task,
+    xq_init_list,
+    P_weight1,
+    P_weight2,
+    max_iter_ADMM,
+):
+    print(">> Starting JAX ADMM Forward Calculation...")
+    start_time = TM.time()
+    results = MPC_jax.jax_ADMM_forward_MPC(
+        Ref_xl=Ref_xl_flat,
+        Ref_ul=Ref_ul_flat,
+        ref_xq=ref_xq_list,
+        ref_uq=ref_uq_single,
+        xl_fb=xl_init_task,
+        xq_fb=np.concatenate(xq_init_list),
+        paral=P_weight1,
+        parac=P_weight2,
+        max_iter_ADMM=max_iter_ADMM
+    )
+    elapsed_ms = (TM.time() - start_time) * 1000.0
+    print(f">>> JAX Calculation Finished in {elapsed_ms:.2f} ms")
+    return results, elapsed_ms
 
 
 def verify_jax_planner(task_idx=None, show_plots=None):
@@ -122,21 +219,11 @@ def verify_jax_planner(task_idx=None, show_plots=None):
                           rl, nq, rq, mq, fqmax,
                           cl0, ro])
 
-    # ================= 初始化环境与规划器 =================
-    print(f"Loading JAX Planner from JustWorkingOnIt.py...")
-    # 初始化 JAX 规划器
-    MPC_jax = JAX_Planner.MPC_Planner(sysm_para, dt, horizon)
-    MPC_jax.verbose = os.environ.get("VERIFY_JAX_VERBOSE", "0") == "1"
-    MPC_jax.pob1 = np.array([pob1[0, 0], pob1[1, 0], 0.0])
-    MPC_jax.pob2 = np.array([pob2[0, 0], pob2[1, 0], 0.0])
-    
-    # 初始化原版动力学 (用于生成参考轨迹 Minisnap + 原版 forward)
-    sysm = Original_Dyn.multilift_model(sysm_para, dt)
-    
     # 定义辅助转换函数 (用于处理神经网络输出)
     # 这些数字来自原版 main 脚本
-    D_outl = MPC_jax.npl 
-    D_outi = MPC_jax.npi
+    # 这里会在 JAX planner 初始化之后再真正绑定维度。
+    D_outl = None
+    D_outi = None
     
     def convert_nn_l(nn_l_outcolumn):
         nn_l_row = np.zeros((1, D_outl))
@@ -173,33 +260,29 @@ def verify_jax_planner(task_idx=None, show_plots=None):
         rg_task_val = rg_task_val.reshape(3, 1)
         
     print(f"Load Eccentricity (rg): {rg_task_val.flatten()}")
-    
-    # 更新 JAX 规划器的 rg 参数
-    MPC_jax.rg = rg_task_val
-    MPC_jax.allocation_martrix(rg_task_val)
 
-    # 初始化原版规划器（完整符号图）
-    sysm.Rotational_Inertia(rp_task_val)
-    sysm.model()
-    MPC_orig = Original_Planner.MPC_Planner(sysm_para, dt, horizon)
-    MPC_orig.Rotational_Inertia(rp_task_val)
-    MPC_orig.allocation_martrix(rg_task_val)
-    MPC_orig.SetStateVariables(sysm.xl, sysm.xi)
-    MPC_orig.SetCtrlVariables(sysm.ul, sysm.ui)
-    MPC_orig.SetDyns(sysm.model_l, sysm.model_i)
-    MPC_orig.SetWeightPara()
-    MPC_orig.SetPayloadCostDyn(max_iter_ADMM)
-    MPC_orig.SetCableCostDyn(max_iter_ADMM)
-    MPC_orig.SetConstriants(pob1, pob2)
-    MPC_orig.SetADMMSubP2_SoftCost_k()
-    MPC_orig.SetADMMSubP2_SoftCost_N()
-    MPC_orig.ADMM_SubP2_Init()
-    MPC_orig.ADMM_SubP2_N_Init()
-    MPC_orig.Load_derivatives_DDP_ADMM()
-    MPC_orig.Cable_derivatives_DDP_ADMM()
-    MPC_orig.system_derivatives_SubP2_ADMM_k()
-    MPC_orig.system_derivatives_SubP2_ADMM_N()
-    MPC_orig.system_derivatives_SubP3_ADMM()
+    # ================= 新版 / 旧版初始化分开 =================
+    MPC_jax = _init_jax_planner_case(
+        JAX_Planner=JAX_Planner,
+        sysm_para=sysm_para,
+        dt=dt,
+        horizon=horizon,
+        pob1=pob1,
+        pob2=pob2,
+        rg_task_val=rg_task_val,
+    )
+    sysm, MPC_orig = _init_original_planner_case(
+        sysm_para=sysm_para,
+        dt=dt,
+        horizon=horizon,
+        pob1=pob1,
+        pob2=pob2,
+        rp_task_val=rp_task_val,
+        rg_task_val=rg_task_val,
+        max_iter_ADMM=max_iter_ADMM,
+    )
+    D_outl = MPC_jax.npl
+    D_outi = MPC_jax.npi
 
     # 2. 加载神经网络
     # 注意：这里假设你使用的是 'trained_nn_l_4_3_n.pt' 这种格式，需根据实际情况调整文件名
@@ -305,40 +388,32 @@ def verify_jax_planner(task_idx=None, show_plots=None):
         ref_xq_flat = np.tile(xi_0, horizon + 1)
         ref_xq_list.append(ref_xq_flat)
 
-    # ================= 执行原版求解 =================
-    print(">> Starting ORIGINAL (CasADi) ADMM Forward Calculation...")
-    start_time = TM.time()
-    opt_sol_orig, *_ = MPC_orig.ADMM_forward_MPC(
-        Ref_xl=Ref_xl_flat,
-        Ref_ul=Ref_ul_flat,
-        ref_xq=ref_xq_list,
-        ref_uq=ref_uq_single,
-        xl_fb=xl_init_task,
-        xq_fb=np.concatenate(xq_init_list),
-        paral=P_weight1,
-        paraC=P_weight2,
-        max_iter_ADMM=max_iter_ADMM
+    # ================= 分别执行旧版 / 新版 =================
+    # 这里显式拆成两个函数，避免 verify_jax_planner 把两条主线揉在一个大函数里。
+    opt_sol_orig, original_ms = _run_original_planner_case(
+        MPC_orig=MPC_orig,
+        Ref_xl_flat=Ref_xl_flat,
+        Ref_ul_flat=Ref_ul_flat,
+        ref_xq_list=ref_xq_list,
+        ref_uq_single=ref_uq_single,
+        xl_init_task=xl_init_task,
+        xq_init_list=xq_init_list,
+        P_weight1=P_weight1,
+        P_weight2=P_weight2,
+        max_iter_ADMM=max_iter_ADMM,
     )
-    end_time = TM.time()
-    print(f">>> ORIGINAL Calculation Finished in {(end_time - start_time)*1000:.2f} ms")
-
-    # ================= 执行 JAX 求解 =================
-    print(">> Starting JAX ADMM Forward Calculation...")
-    start_time = TM.time()
-    results = MPC_jax.jax_ADMM_forward_MPC(
-        Ref_xl=Ref_xl_flat,
-        Ref_ul=Ref_ul_flat,
-        ref_xq=ref_xq_list, # List of flattened arrays
-        ref_uq=ref_uq_single,
-        xl_fb=xl_init_task,
-        xq_fb=np.concatenate(xq_init_list),
-        paral=P_weight1,
-        parac=P_weight2,
-        max_iter_ADMM=max_iter_ADMM
+    results, jax_ms = _run_jax_planner_case(
+        MPC_jax=MPC_jax,
+        Ref_xl_flat=Ref_xl_flat,
+        Ref_ul_flat=Ref_ul_flat,
+        ref_xq_list=ref_xq_list,
+        ref_uq_single=ref_uq_single,
+        xl_init_task=xl_init_task,
+        xq_init_list=xq_init_list,
+        P_weight1=P_weight1,
+        P_weight2=P_weight2,
+        max_iter_ADMM=max_iter_ADMM,
     )
-    
-    end_time = TM.time()
-    print(f">>> JAX Calculation Finished in {(end_time - start_time)*1000:.2f} ms")
 
     # ================= 数值对比 =================
     xl_orig = np.array(opt_sol_orig['xl_traj'])            # (N+1, 13)
@@ -473,6 +548,8 @@ def verify_jax_planner(task_idx=None, show_plots=None):
         "task_idx": task_idx,
         "horizon": horizon,
         "admm_iters": max_iter_ADMM,
+        "original_total_ms": original_ms,
+        "current_total_ms": jax_ms,
         "jax_profile": results.get("profile"),
         "diff": {
             "load_state_xl": diff_load_state,
