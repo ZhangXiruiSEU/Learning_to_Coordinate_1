@@ -14,21 +14,32 @@ using ExaModels
 #
 # 如果你现在只关心"当前正式 batch 主线"，最小阅读顺序建议是：
 # 1. StepData                         # 单步数据长什么样
-# 2. step_data_from_json(...)         # Python/JSON snapshot 如何落成 Julia step
-# 3. pair_term_indexed / gio_terms_indexed / thrust_terms_indexed
-# 4. objective(...)
-# 5. equality_residual(...)
-# 6. inequality_residual(...)
+# 2. as_vec / as_mat                 # JSON/嵌套数组如何稳定转成 Float64 容器
+# 3. q_to_rotation / unpack_w / cross3
+#                                    # 目标/残差都会复用的底层数学 helper
+# 4. pair_term_indexed / gio_terms_indexed / thrust_terms_indexed
+#                                    # 当前 JuMP 参数化模型直接复用的 indexed helper
+# 5. objective(...)
+# 6. equality_residual(...)
+# 7. inequality_residual(...)
+# 8. step_data_from_json / load_step_data
+#                                    # Python/JSON snapshot 如何落成 Julia step
 #
 # 当前主线里可先跳过的部分：
+# - rowmajor_vec(...)
+#   小型兼容 helper，当前主线基本不依赖它
 # - pair_term_from_x / gio_terms_from_x / thrust_terms_from_x
 #   主要给 ExaModels/按 accessor 取值的旧路径用
 # - control_bound_from_x(...)
 #   小型 helper，当前主线没直接走到
+# - x_xl / x_ul / x_xi / x_ui / q_to_rotation_from_x
+#   这组 accessor/from_x helper 主要服务旧 ExaModels 路径
 # - add_native_equality_constraints!(...)
 # - add_native_inequality_constraints!(...)
 # - build_examodel(...)
 #   这三块属于 ExaModels 建模路径，当前 persistent Julia + JuMP/MadNLP 主线不直接调用
+# - equality_component / inequality_component(...)
+#   诊断/兼容接口，当前主线通常直接看整向量 residual
 # - inequality_resual_component(...)
 #   兼容旧拼写的别名，不是新的核心入口
 # -----------------------------------------------------------------------------
@@ -91,19 +102,6 @@ function as_mat(x)
     return out
 end
 
-# 按行展平矩阵。当前 persistent batch 主线基本不依赖它，
-# 更偏工具/兼容 helper，可先跳过。
-function rowmajor_vec(mat)
-    out = Any[]
-    sizehint!(out, length(mat))
-    for i in axes(mat, 1)
-        for j in axes(mat, 2)
-            push!(out, mat[i, j])
-        end
-    end
-    return out
-end
-
 # 四元数 -> 旋转矩阵。
 # equality/inequality residual 和若干单步建模函数都会复用。
 function q_to_rotation(q)
@@ -136,35 +134,6 @@ function unpack_w(w, dims)
     return xl, ul, xc, uc
 end
 
-# 下面这组 accessor 主要给"按索引直接拼表达式"的底层 helper 用。
-# 其中 indexed 版本在当前 batch 主线会间接用到；from_x 版本主要服务 ExaModels 路径。
-@inline x_xl(w, idx) = w[idx]
-@inline x_ul(w, nxl, idx) = w[nxl + idx]
-@inline x_xi(w, dims, i, j) = begin
-    nxl, nul, nxi, nui, _, _ = dims
-    base = nxl + nul + (i - 1) * (nxi + nui)
-    w[base + j]
-end
-@inline x_ui(w, dims, i, j) = begin
-    nxl, nul, nxi, nui, _, _ = dims
-    base = nxl + nul + (i - 1) * (nxi + nui)
-    w[base + nxi + j]
-end
-
-# 从打平变量向量里直接取负载四元数并展开旋转矩阵。
-# 主要给 ExaModels 约束构造路径用，当前 batch 主线不直接走这里。
-function q_to_rotation_from_x(w, dims)
-    q0 = x_xl(w, 7)
-    q1 = x_xl(w, 8)
-    q2 = x_xl(w, 9)
-    q3 = x_xl(w, 10)
-    return [
-        2 * (q0^2 + q1^2) - 1  2 * (q1 * q2 - q0 * q3)  2 * (q1 * q3 + q0 * q2);
-        2 * (q1 * q2 + q0 * q3)  2 * (q0^2 + q2^2) - 1  2 * (q2 * q3 - q0 * q1);
-        2 * (q1 * q3 - q0 * q2)  2 * (q2 * q3 + q0 * q1)  2 * (q0^2 + q3^2) - 1;
-    ]
-end
-
 # 手写 3D 叉乘，避免在符号/建模表达式里频繁构小向量。
 function cross3(ax, ay, az, bx, by, bz)
     return (
@@ -172,73 +141,6 @@ function cross3(ax, ay, az, bx, by, bz)
         az * bx - ax * bz,
         ax * by - ay * bx,
     )
-end
-
-# 旧的 from_x 版本推力项 helper：
-# - 主要服务 ExaModels / accessor 风格约束构造
-# - 当前 persistent batch 主线更直接用下面的 thrust_terms_indexed(...)
-# 所以这里属于"可先跳过，但不是废代码"。
-Base.@noinline function thrust_terms_from_x(w, dims, Rl, wl, awl, ra1, ra2, ra3, cl0, mq, ml, g, ul1, ul2, ul3, i)
-    d1 = x_xi(w, dims, i, 1)
-    d2 = x_xi(w, dims, i, 2)
-    d3 = x_xi(w, dims, i, 3)
-    w1 = x_xi(w, dims, i, 4)
-    w2 = x_xi(w, dims, i, 5)
-    w3 = x_xi(w, dims, i, 6)
-    dw1 = x_xi(w, dims, i, 7)
-    dw2 = x_xi(w, dims, i, 8)
-    dw3 = x_xi(w, dims, i, 9)
-    t = x_xi(w, dims, i, 13)
-
-    cwr1, cwr2, cwr3 = cross3(wl[1], wl[2], wl[3], ra1, ra2, ra3)
-    cwcr1, cwcr2, cwcr3 = cross3(wl[1], wl[2], wl[3], cwr1, cwr2, cwr3)
-    car1, car2, car3 = cross3(awl[1], awl[2], awl[3], ra1, ra2, ra3)
-    rotb1 = cwcr1 + car1
-    rotb2 = cwcr2 + car2
-    rotb3 = cwcr3 + car3
-    rot1 = Rl[1, 1] * rotb1 + Rl[1, 2] * rotb2 + Rl[1, 3] * rotb3
-    rot2 = Rl[2, 1] * rotb1 + Rl[2, 2] * rotb2 + Rl[2, 3] * rotb3
-    rot3 = Rl[3, 1] * rotb1 + Rl[3, 2] * rotb2 + Rl[3, 3] * rotb3
-
-    cdd1, cdd2, cdd3 = cross3(dw1, dw2, dw3, d1, d2, d3)
-    cwd1, cwd2, cwd3 = cross3(w1, w2, w3, d1, d2, d3)
-    cwwd1, cwwd2, cwwd3 = cross3(w1, w2, w3, cwd1, cwd2, cwd3)
-    cable1 = cl0 * (cdd1 + cwwd1)
-    cable2 = cl0 * (cdd2 + cwwd2)
-    cable3 = cl0 * (cdd3 + cwwd3)
-
-    f1 = mq * (ul1 / ml + rot1 + cable1) + d1 * t
-    f2 = mq * (ul2 / ml + rot2 + cable2) + d2 * t
-    # Match inequality_residual: al3 = ul3 / ml - g, then + g inside fi[3].
-    # Net effect is ul3 / ml + rot3 + cable3 without an extra gravity term.
-    f3 = mq * (ul3 / ml + rot3 + cable3) + d3 * t
-    return f1, f2, f3
-end
-
-# 旧的 from_x 版本绳索-绳索间距项 helper，主要给 ExaModels 路径用。
-Base.@noinline function pair_term_from_x(w, dims, Rl, ra_i1, ra_i2, ra_i3, ra_j1, ra_j2, ra_j3, cl0, rq, eps_margin, kc, num_dis, i, j)
-    frac = kc / num_dis
-    pib_i1 = ra_i1 + frac * cl0 * (Rl[1, 1] * x_xi(w, dims, i, 1) + Rl[2, 1] * x_xi(w, dims, i, 2) + Rl[3, 1] * x_xi(w, dims, i, 3))
-    pib_i2 = ra_i2 + frac * cl0 * (Rl[1, 2] * x_xi(w, dims, i, 1) + Rl[2, 2] * x_xi(w, dims, i, 2) + Rl[3, 2] * x_xi(w, dims, i, 3))
-    pib_j1 = ra_j1 + frac * cl0 * (Rl[1, 1] * x_xi(w, dims, j, 1) + Rl[2, 1] * x_xi(w, dims, j, 2) + Rl[3, 1] * x_xi(w, dims, j, 3))
-    pib_j2 = ra_j2 + frac * cl0 * (Rl[1, 2] * x_xi(w, dims, j, 1) + Rl[2, 2] * x_xi(w, dims, j, 2) + Rl[3, 2] * x_xi(w, dims, j, 3))
-    return ((kc / num_dis) * 4.0 * rq)^2 + eps_margin - ((pib_i1 - pib_j1)^2 + (pib_i2 - pib_j2)^2)
-end
-
-# 旧的 from_x 版本几何约束 helper，主要给 ExaModels 路径用。
-Base.@noinline function gio_terms_from_x(w, dims, Rl, ra1, ra2, ra3, cl0, rl, num_dis, i)
-    frac = num_dis / num_dis
-    ra_norm = sqrt(ra1^2 + ra2^2 + ra3^2) + 1e-9
-    pib1 = ra1 + frac * cl0 * (Rl[1, 1] * x_xi(w, dims, i, 1) + Rl[2, 1] * x_xi(w, dims, i, 2) + Rl[3, 1] * x_xi(w, dims, i, 3))
-    pib2 = ra2 + frac * cl0 * (Rl[1, 2] * x_xi(w, dims, i, 1) + Rl[2, 2] * x_xi(w, dims, i, 2) + Rl[3, 2] * x_xi(w, dims, i, 3))
-    ei_pib = (ra1 / ra_norm) * pib1 + (ra2 / ra_norm) * pib2
-    return ei_pib - (rl + cl0), -rl - ei_pib
-end
-
-# 控制量上下界的小 helper。当前 persistent batch 主线没有直接用到，
-# 保留它主要是为了旧路径/局部表达式复用。
-@inline function control_bound_from_x(w, dims, active_u, ui_bound, i, j, sign)
-    return active_u * (sign * x_ui(w, dims, i, j) - ui_bound)
 end
 
 # 当前 batch 主线会直接复用的 indexed helper：
@@ -359,11 +261,6 @@ function equality_residual(w, params, dims)
     end
     append!(out, vec(active_u .* (wrench_generated .- wrench_target)))
     return out
-end
-
-# 单独取某一维等式残差。更偏诊断/兼容接口，当前主线一般不单独调它。
-function equality_component(w, params, dims, idx)
-    return equality_residual(w, params, dims)[idx]
 end
 
 # 当前主线会直接依赖的不等式残差定义。
@@ -496,6 +393,162 @@ function inequality_residual(w, params, dims)
     append!(ineq, thrust_upper)
     append!(ineq, thrust_lower)
     return ineq
+end
+
+# 当前 batch 主线必经的数据入口之一。
+# Python 发来的 step snapshot / stacked JSON 最终都会被整理成 StepData。
+function step_data_from_json(data)
+    dims = Tuple(Int.(data["step"]["dims"]))
+    step = data["step"]
+    x_init = as_vec(step["x_init"])
+    x_orig =
+        haskey(step, "original_step_reference") ? as_vec(step["original_step_reference"]) : copy(x_init)
+    init_ref = get(step, "init_reference_values", nothing)
+    orig_ref = get(step, "original_reference_values", nothing)
+    eq_dim = haskey(data["meta"], "eq_dim") ? Int(data["meta"]["eq_dim"]) : 0
+    ineq_dim = haskey(data["meta"], "ineq_dim") ? Int(data["meta"]["ineq_dim"]) : 0
+    return StepData(
+        data["meta"],
+        dims,
+        step["params_t"],
+        x_init,
+        x_orig,
+        init_ref === nothing ? NaN : Float64(init_ref["objective"]),
+        init_ref === nothing ? zeros(Float64, eq_dim) : as_vec(init_ref["eq_vec"]),
+        init_ref === nothing ? zeros(Float64, ineq_dim) : as_vec(init_ref["ineq_vec"]),
+        orig_ref === nothing ? NaN : Float64(orig_ref["objective"]),
+        orig_ref === nothing ? zeros(Float64, eq_dim) : as_vec(orig_ref["eq_vec"]),
+        orig_ref === nothing ? zeros(Float64, ineq_dim) : as_vec(orig_ref["ineq_vec"]),
+    )
+end
+
+# 文件路径包装层，主要给单步离线调试用。当前 persistent worker 主线更常直接走内存 payload。
+function load_step_data(path::String)
+    data = JSON3.read(read(path, String))
+    return step_data_from_json(data)
+end
+
+# -----------------------------------------------------------------------------
+# 以下代码不是当前 persistent Julia 主线必经路径，统一下沉到底部：
+# - rowmajor_vec(...)
+# - x_xl/x_ul/x_xi/x_ui accessor
+# - q_to_rotation_from_x(...)
+# - *_from_x(...) / control_bound_from_x(...)
+# - equality_component / inequality_component / inequality_resual_component
+# - ExaModels 约束构造和 build_examodel(...)
+# -----------------------------------------------------------------------------
+
+# 按行展平矩阵。当前 persistent batch 主线基本不依赖它，
+# 更偏工具/兼容 helper，可先跳过。
+function rowmajor_vec(mat)
+    out = Any[]
+    sizehint!(out, length(mat))
+    for i in axes(mat, 1)
+        for j in axes(mat, 2)
+            push!(out, mat[i, j])
+        end
+    end
+    return out
+end
+
+# 下面这组 accessor 主要给"按索引直接拼表达式"的底层 helper 用。
+# 当前 batch 主线更常直接走 indexed helper，不依赖这些 accessor 风格函数。
+@inline x_xl(w, idx) = w[idx]
+@inline x_ul(w, nxl, idx) = w[nxl + idx]
+@inline x_xi(w, dims, i, j) = begin
+    nxl, nul, nxi, nui, _, _ = dims
+    base = nxl + nul + (i - 1) * (nxi + nui)
+    w[base + j]
+end
+@inline x_ui(w, dims, i, j) = begin
+    nxl, nul, nxi, nui, _, _ = dims
+    base = nxl + nul + (i - 1) * (nxi + nui)
+    w[base + nxi + j]
+end
+
+# 从打平变量向量里直接取负载四元数并展开旋转矩阵。
+# 主要给 ExaModels 约束构造路径用，当前 batch 主线不直接走这里。
+function q_to_rotation_from_x(w, dims)
+    q0 = x_xl(w, 7)
+    q1 = x_xl(w, 8)
+    q2 = x_xl(w, 9)
+    q3 = x_xl(w, 10)
+    return [
+        2 * (q0^2 + q1^2) - 1  2 * (q1 * q2 - q0 * q3)  2 * (q1 * q3 + q0 * q2);
+        2 * (q1 * q2 + q0 * q3)  2 * (q0^2 + q2^2) - 1  2 * (q2 * q3 - q0 * q1);
+        2 * (q1 * q3 - q0 * q2)  2 * (q2 * q3 + q0 * q1)  2 * (q0^2 + q3^2) - 1;
+    ]
+end
+
+# 旧的 from_x 版本推力项 helper：
+# - 主要服务 ExaModels / accessor 风格约束构造
+# - 当前 persistent batch 主线更直接用上面的 thrust_terms_indexed(...)
+Base.@noinline function thrust_terms_from_x(w, dims, Rl, wl, awl, ra1, ra2, ra3, cl0, mq, ml, g, ul1, ul2, ul3, i)
+    d1 = x_xi(w, dims, i, 1)
+    d2 = x_xi(w, dims, i, 2)
+    d3 = x_xi(w, dims, i, 3)
+    w1 = x_xi(w, dims, i, 4)
+    w2 = x_xi(w, dims, i, 5)
+    w3 = x_xi(w, dims, i, 6)
+    dw1 = x_xi(w, dims, i, 7)
+    dw2 = x_xi(w, dims, i, 8)
+    dw3 = x_xi(w, dims, i, 9)
+    t = x_xi(w, dims, i, 13)
+
+    cwr1, cwr2, cwr3 = cross3(wl[1], wl[2], wl[3], ra1, ra2, ra3)
+    cwcr1, cwcr2, cwcr3 = cross3(wl[1], wl[2], wl[3], cwr1, cwr2, cwr3)
+    car1, car2, car3 = cross3(awl[1], awl[2], awl[3], ra1, ra2, ra3)
+    rotb1 = cwcr1 + car1
+    rotb2 = cwcr2 + car2
+    rotb3 = cwcr3 + car3
+    rot1 = Rl[1, 1] * rotb1 + Rl[1, 2] * rotb2 + Rl[1, 3] * rotb3
+    rot2 = Rl[2, 1] * rotb1 + Rl[2, 2] * rotb2 + Rl[2, 3] * rotb3
+    rot3 = Rl[3, 1] * rotb1 + Rl[3, 2] * rotb2 + Rl[3, 3] * rotb3
+
+    cdd1, cdd2, cdd3 = cross3(dw1, dw2, dw3, d1, d2, d3)
+    cwd1, cwd2, cwd3 = cross3(w1, w2, w3, d1, d2, d3)
+    cwwd1, cwwd2, cwwd3 = cross3(w1, w2, w3, cwd1, cwd2, cwd3)
+    cable1 = cl0 * (cdd1 + cwwd1)
+    cable2 = cl0 * (cdd2 + cwwd2)
+    cable3 = cl0 * (cdd3 + cwwd3)
+
+    f1 = mq * (ul1 / ml + rot1 + cable1) + d1 * t
+    f2 = mq * (ul2 / ml + rot2 + cable2) + d2 * t
+    # Match inequality_residual: al3 = ul3 / ml - g, then + g inside fi[3].
+    # Net effect is ul3 / ml + rot3 + cable3 without an extra gravity term.
+    f3 = mq * (ul3 / ml + rot3 + cable3) + d3 * t
+    return f1, f2, f3
+end
+
+# 旧的 from_x 版本绳索-绳索间距项 helper，主要给 ExaModels 路径用。
+Base.@noinline function pair_term_from_x(w, dims, Rl, ra_i1, ra_i2, ra_i3, ra_j1, ra_j2, ra_j3, cl0, rq, eps_margin, kc, num_dis, i, j)
+    frac = kc / num_dis
+    pib_i1 = ra_i1 + frac * cl0 * (Rl[1, 1] * x_xi(w, dims, i, 1) + Rl[2, 1] * x_xi(w, dims, i, 2) + Rl[3, 1] * x_xi(w, dims, i, 3))
+    pib_i2 = ra_i2 + frac * cl0 * (Rl[1, 2] * x_xi(w, dims, i, 1) + Rl[2, 2] * x_xi(w, dims, i, 2) + Rl[3, 2] * x_xi(w, dims, i, 3))
+    pib_j1 = ra_j1 + frac * cl0 * (Rl[1, 1] * x_xi(w, dims, j, 1) + Rl[2, 1] * x_xi(w, dims, j, 2) + Rl[3, 1] * x_xi(w, dims, j, 3))
+    pib_j2 = ra_j2 + frac * cl0 * (Rl[1, 2] * x_xi(w, dims, j, 1) + Rl[2, 2] * x_xi(w, dims, j, 2) + Rl[3, 2] * x_xi(w, dims, j, 3))
+    return ((kc / num_dis) * 4.0 * rq)^2 + eps_margin - ((pib_i1 - pib_j1)^2 + (pib_i2 - pib_j2)^2)
+end
+
+# 旧的 from_x 版本几何约束 helper，主要给 ExaModels 路径用。
+Base.@noinline function gio_terms_from_x(w, dims, Rl, ra1, ra2, ra3, cl0, rl, num_dis, i)
+    frac = num_dis / num_dis
+    ra_norm = sqrt(ra1^2 + ra2^2 + ra3^2) + 1e-9
+    pib1 = ra1 + frac * cl0 * (Rl[1, 1] * x_xi(w, dims, i, 1) + Rl[2, 1] * x_xi(w, dims, i, 2) + Rl[3, 1] * x_xi(w, dims, i, 3))
+    pib2 = ra2 + frac * cl0 * (Rl[1, 2] * x_xi(w, dims, i, 1) + Rl[2, 2] * x_xi(w, dims, i, 2) + Rl[3, 2] * x_xi(w, dims, i, 3))
+    ei_pib = (ra1 / ra_norm) * pib1 + (ra2 / ra_norm) * pib2
+    return ei_pib - (rl + cl0), -rl - ei_pib
+end
+
+# 控制量上下界的小 helper。当前 persistent batch 主线没有直接用到，
+# 保留它主要是为了旧路径/局部表达式复用。
+@inline function control_bound_from_x(w, dims, active_u, ui_bound, i, j, sign)
+    return active_u * (sign * x_ui(w, dims, i, j) - ui_bound)
+end
+
+# 单独取某一维等式残差。更偏诊断/兼容接口，当前主线一般不单独调它。
+function equality_component(w, params, dims, idx)
+    return equality_residual(w, params, dims)[idx]
 end
 
 # 单独取某一维不等式残差。主要给诊断/兼容接口用。
@@ -735,39 +788,6 @@ function add_native_inequality_constraints!(core, x, step::StepData; include_thr
             ucon = 0.0,
         )
     end
-end
-
-# 当前 batch 主线必经的数据入口之一。
-# Python 发来的 step snapshot / stacked JSON 最终都会被整理成 StepData。
-function step_data_from_json(data)
-    dims = Tuple(Int.(data["step"]["dims"]))
-    step = data["step"]
-    x_init = as_vec(step["x_init"])
-    x_orig =
-        haskey(step, "original_step_reference") ? as_vec(step["original_step_reference"]) : copy(x_init)
-    init_ref = get(step, "init_reference_values", nothing)
-    orig_ref = get(step, "original_reference_values", nothing)
-    eq_dim = haskey(data["meta"], "eq_dim") ? Int(data["meta"]["eq_dim"]) : 0
-    ineq_dim = haskey(data["meta"], "ineq_dim") ? Int(data["meta"]["ineq_dim"]) : 0
-    return StepData(
-        data["meta"],
-        dims,
-        step["params_t"],
-        x_init,
-        x_orig,
-        init_ref === nothing ? NaN : Float64(init_ref["objective"]),
-        init_ref === nothing ? zeros(Float64, eq_dim) : as_vec(init_ref["eq_vec"]),
-        init_ref === nothing ? zeros(Float64, ineq_dim) : as_vec(init_ref["ineq_vec"]),
-        orig_ref === nothing ? NaN : Float64(orig_ref["objective"]),
-        orig_ref === nothing ? zeros(Float64, eq_dim) : as_vec(orig_ref["eq_vec"]),
-        orig_ref === nothing ? zeros(Float64, ineq_dim) : as_vec(orig_ref["ineq_vec"]),
-    )
-end
-
-# 文件路径包装层，主要给单步离线调试用。当前 persistent worker 主线更常直接走内存 payload。
-function load_step_data(path::String)
-    data = JSON3.read(read(path, String))
-    return step_data_from_json(data)
 end
 
 # 可先跳过：ExaModels 建模入口。

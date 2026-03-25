@@ -81,8 +81,12 @@ mutable struct CachedStepSolver
 end
 
 const _STEP_SOLVER_CACHE = Dict{Tuple{Int, String}, CachedStepSolver}()
+# 这个锁只保护全局 solver cache 字典本身的查/写。
+# 正常 step 求解热路径不会一直持有它。
 const _STEP_SOLVER_CACHE_LOCK = ReentrantLock()
 const _STACKED_BATCH_TEMPLATE_CACHE = Dict{Any, Vector{CachedStepSolver}}()
+# 这个锁只保护整批 template 容器的查/写。
+# 各线程拿到自己的 template[idx] 后，就各管各的求解，不再靠这个锁同步。
 const _STACKED_BATCH_TEMPLATE_CACHE_LOCK = ReentrantLock()
 
 # 结构缓存键只区分"问题结构"，不区分当前轮次的参数值。
@@ -308,6 +312,15 @@ end
 # - 每架无人机对应的缆绳状态/控制块
 #
 # 这里建的是"结构固定、参数可更新"的模型骨架。
+# 和 solve_step_madnlp_jump_native_eq.jl 里的 build_jump_model_eq(...) 相比：
+# - 那边是单步参考/离线版：直接把一个 StepData 的数值写死进模型
+# - 这里是当前 batch 主线版：把会变的量建成 JuMP Parameter
+# - 因此当前主线可以：
+#   1. 只建一次模型骨架
+#   2. 每轮 ADMM / 每个 step 只更新参数
+#   3. 复用 warm start 和 solver 槽位
+# 也就是说，两边表达的是同一个单步 NLP，本质差别不在数学定义，
+# 而在“模型是一次性构造，还是参数化后长期复用”。
 function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = true)
     model = Model(MadNLP.Optimizer)
     set_silent(model)
@@ -670,45 +683,6 @@ function _set_static_mat_if_changed!(params, name::String, pref, src)
     return nothing
 end
 
-# 旧路径：每个 step 都是完整 JSON step 对象。
-# 这条路径更直观，但运行时会有更多对象构造和字段拆装开销。
-function update_parameterized_step!(cached::CachedStepSolver, step::SubP2StepModel.StepData)
-    p = step.params
-    refs = cached.params
-    set_parameter_value(refs.rho_lx, Float64(p["rho_lx"]))
-    set_parameter_value(refs.rho_lu, Float64(p["rho_lu"]))
-    set_parameter_value(refs.rho_ix, Float64(p["rho_ix"]))
-    set_parameter_value(refs.rho_iu, Float64(p["rho_iu"]))
-    set_parameter_value(refs.is_terminal, Float64(p["is_terminal"]))
-    _set_param_vec!(refs.xl_ideal, as_vec(p["xl_ideal"]))
-    _set_param_vec!(refs.ul_ideal, as_vec(p["ul_ideal"]))
-    _set_param_vec!(refs.y_xl, as_vec(p["y_xl"]))
-    _set_param_vec!(refs.y_ul, as_vec(p["y_ul"]))
-    _set_param_mat!(refs.xc_ideal, as_mat(p["xc_ideal"]))
-    _set_param_mat!(refs.uc_ideal, as_mat(p["uc_ideal"]))
-    _set_param_mat!(refs.y_xc, as_mat(p["y_xc"]))
-    _set_param_mat!(refs.y_uc, as_mat(p["y_uc"]))
-    _set_param_mat!(refs.Pt, as_mat(p["Pt"]))
-    _set_param_vec!(refs.pob1, as_vec(p["pob1"]))
-    _set_param_vec!(refs.pob2, as_vec(p["pob2"]))
-    _set_param_mat!(refs.ra, transpose(as_mat(p["ra"])))
-    set_parameter_value(refs.ro, Float64(p["ro"]))
-    set_parameter_value(refs.rq, Float64(p["rq"]))
-    set_parameter_value(refs.cl0, Float64(p["cl0"]))
-    set_parameter_value(refs.rl, Float64(p["rl"]))
-    set_parameter_value(refs.t_min, Float64(p["t_min"]))
-    set_parameter_value(refs.t_max, Float64(p["t_max"]))
-    set_parameter_value(refs.ui_bound, Float64(p["ui_bound"]))
-    set_parameter_value(refs.g, Float64(p["g"]))
-    set_parameter_value(refs.ml, Float64(p["ml"]))
-    set_parameter_value(refs.mq, Float64(p["mq"]))
-    set_parameter_value(refs.fmax, Float64(p["fmax"]))
-    _set_param_mat!(refs.Jl, as_mat(p["Jl"]))
-    _set_param_mat!(refs.Jl_inv, as_mat(p["Jl_inv"]))
-    cached.step = step
-    return nothing
-end
-
 # 主线路径：从 stacked runtime payload 中，按 idx 原地更新一个 cached step。
 #
 # 这里专门把"动态参数"和"静态参数"拆开：
@@ -861,71 +835,6 @@ function warm_slot(step::SubP2StepModel.StepData)
     return 0
 end
 
-# 单步求解的完整返回版本。
-# 适合 legacy 路径或者调试时保留更多字段。
-function solve_cached_step!(
-    cached::CachedStepSolver;
-    slot::Int = 0,
-    max_iter = 200,
-    acceptable_tol = 1e-4,
-    acceptable_iter = 5,
-    tol = 1e-8,
-    runtime_only::Bool = false,
-    runtime_metric_mode::Symbol = :full,
-)
-    set_solver_options!(
-        cached;
-        max_iter = max_iter,
-        acceptable_tol = acceptable_tol,
-        acceptable_iter = acceptable_iter,
-        tol = tol,
-    )
-    warm_sol = cached.warm_slot_id == slot ? cached.warm_solution : nothing
-    if warm_sol !== nothing
-        _set_start_values!(cached.xrefs, warm_sol)
-    else
-        _set_start_values!(cached.xrefs, cached.step.x_init)
-    end
-    optimize!(cached.model)
-    x_sol = _read_solution(cached.xrefs)
-    _store_warm_solution!(cached, slot, x_sol)
-    metrics = if runtime_only
-        if runtime_metric_mode == :none
-            (
-                eq_inf = nothing,
-                ineq_vio = nothing,
-            )
-        else
-            eq_vec = Float64.(equality_residual(x_sol, cached.step.params, cached.step.dims))
-            ineq_vec = Float64.(inequality_residual(x_sol, cached.step.params, cached.step.dims))
-            (
-                eq_inf = maximum(abs.(eq_vec)),
-                ineq_vio = maximum(max.(ineq_vec, 0.0)),
-            )
-        end
-    else
-        summarize_solution(cached.step, x_sol)
-    end
-    status = string(termination_status(cached.model))
-    primal = string(primal_status(cached.model))
-    iter = _optimizer_iter_count(cached.model)
-    result = Dict(
-        "status" => status,
-        "primal_status" => primal,
-        "iter" => iter,
-        "eq_inf" => metrics.eq_inf,
-        "ineq_vio" => metrics.ineq_vio,
-        "include_simple_ineq" => true,
-        "x_sol" => x_sol,
-    )
-    if !runtime_only
-        result["objective"] = metrics.objective
-        result["orig_rmse"] = metrics.orig_rmse
-        result["orig_max_abs"] = metrics.orig_max_abs
-    end
-    return result
-end
-
 # 单步求解的紧凑返回版本。
 # 当前 Python 主线更偏向用这条，因为回包更小、重建更轻。
 function solve_cached_step_compact!(
@@ -964,66 +873,6 @@ end
 
 function _solver_cache_key(slot::Int, dims::NTuple{6, Int})
     return (slot, string(structure_cache_key(dims), "|", _backend_key()))
-end
-
-# 如果某个 cached solver 因内部状态问题求解失败，
-# 这里会重建同结构 solver 再重试一次，尽量不让整个 batch 因单个槽位脏掉而崩盘。
-function _solve_with_rebuild_fallback!(
-    cached::CachedStepSolver,
-    step::SubP2StepModel.StepData,
-    cache_key;
-    slot::Int,
-    max_iter,
-    acceptable_tol,
-    acceptable_iter,
-    tol,
-    runtime_only::Bool = false,
-    runtime_metric_mode::Symbol = :full,
-)
-    try
-        cached.step = step
-        return solve_cached_step!(
-            cached;
-            slot = slot,
-            max_iter = max_iter,
-            acceptable_tol = acceptable_tol,
-            acceptable_iter = acceptable_iter,
-            tol = tol,
-            runtime_only = runtime_only,
-            runtime_metric_mode = runtime_metric_mode,
-        )
-    catch err
-        if !(err isa Exception)
-            rethrow(err)
-        end
-        rebuilt = build_cached_step_solver(
-            step;
-            print_level = MadNLP.ERROR,
-            include_simple_ineq = true,
-            max_iter = max_iter,
-            acceptable_tol = acceptable_tol,
-            acceptable_iter = acceptable_iter,
-            tol = tol,
-        )
-        _copy_warm_solution!(rebuilt, cached, slot)
-        cached = lock(_STEP_SOLVER_CACHE_LOCK) do
-            _STEP_SOLVER_CACHE[cache_key] = rebuilt
-            rebuilt
-        end
-        cached.step = step
-        result = solve_cached_step!(
-            cached;
-            slot = slot,
-            max_iter = max_iter,
-            acceptable_tol = acceptable_tol,
-            acceptable_iter = acceptable_iter,
-            tol = tol,
-            runtime_only = runtime_only,
-            runtime_metric_mode = runtime_metric_mode,
-        )
-        result["rebuilt_after_failure"] = true
-        return result
-    end
 end
 
 # stacked_runtime_v1 是当前 Python/JAX -> Julia 主线使用的 payload 协议。
@@ -1098,6 +947,8 @@ function _ensure_stacked_batch_template!(
     tol = 1e-8,
 )
     template_key = (nsteps, dims, _backend_key())
+    # 这里只在“取/放整批 template 容器”时上锁。
+    # 后面真正并行 solve 的时候，各线程只碰自己的 template[idx]，不会拿着这个锁跑。
     template = lock(_STACKED_BATCH_TEMPLATE_CACHE_LOCK) do
         get(_STACKED_BATCH_TEMPLATE_CACHE, template_key, nothing)
     end
@@ -1124,91 +975,6 @@ function _ensure_stacked_batch_template!(
     end
 end
 
-# prepare_batch_payload! 的作用不是求解，而是把模型骨架提前预热好。
-# 这样 Python 可以把"首次建模板"成本和真正 solve 成本拆开看。
-function prepare_batch_payload!(
-    data;
-    max_iter = 200,
-    acceptable_tol = 1e-4,
-    acceptable_iter = 5,
-    tol = 1e-8,
-)
-    if !_has_stacked_runtime_format(data)
-        # ---------------------------
-        # 可先跳过：legacy path
-        # ---------------------------
-        # 这条路径处理的是“每个 step 都是独立 JSON 对象”的旧格式。
-        # 当前 Python/JAX 正式主线默认不会走这里。
-        steps = data["steps"]
-        count = length(steps)
-        t0 = time_ns()
-        built = 0
-        for step_json in steps
-            step = SubP2StepModel.step_data_from_json(step_json)
-            cache_key = _solver_cache_key(step)
-            cached = lock(_STEP_SOLVER_CACHE_LOCK) do
-                get(_STEP_SOLVER_CACHE, cache_key, nothing)
-            end
-            if cached === nothing
-                new_cached = build_cached_step_solver(
-                    step;
-                    print_level = MadNLP.ERROR,
-                    include_simple_ineq = true,
-                    max_iter = max_iter,
-                    acceptable_tol = acceptable_tol,
-                    acceptable_iter = acceptable_iter,
-                    tol = tol,
-                )
-                lock(_STEP_SOLVER_CACHE_LOCK) do
-                    get!(_STEP_SOLVER_CACHE, cache_key, new_cached)
-                end
-                built += 1
-            end
-        end
-        return Dict(
-            "count" => count,
-            "built" => built,
-            "prepare_ms" => (time_ns() - t0) / 1e6,
-            "mode" => "legacy_exact_cache",
-        )
-    end
-
-    # ---------------------------
-    # 当前正式主线从这里开始：
-    # - 读取 stacked batch
-    # - 复用 template
-    # - 按 step 并行 solve
-    # - 返回紧凑 batch 结果
-    # ---------------------------
-    # 当前主线的必经调用链可以直接按这个顺序追：
-    # solve_batch_payload (stacked path)
-    #   -> _ensure_stacked_batch_template!
-    #   -> solve_one_stacked(idx)
-    #   -> _solve_stacked_cached_step!
-    #   -> update_parameterized_step_from_stacked!
-    #   -> solve_cached_step_compact!
-    x_init_batch = _getkey(data, "x_init_batch")
-    nsteps = length(x_init_batch)
-    dims = Tuple(Int(v) for v in _getkey(data, "dims"))
-    target_steps = _getkey(data, "target_steps")
-    t0 = time_ns()
-    _ensure_stacked_batch_template!(
-        data,
-        dims,
-        target_steps,
-        nsteps;
-        max_iter = max_iter,
-        acceptable_tol = acceptable_tol,
-        acceptable_iter = acceptable_iter,
-        tol = tol,
-    )
-    return Dict(
-        "count" => nsteps,
-        "built" => nsteps,
-        "prepare_ms" => (time_ns() - t0) / 1e6,
-        "mode" => "stacked_runtime_template",
-    )
-end
 
 # 用一个现成 template[idx] 去解当前 batch 的第 idx 个 step。
 # 主线路径里真正的热工作就是：
@@ -1334,6 +1100,8 @@ function solve_batch_payload(
             step = SubP2StepModel.step_data_from_json(step_json)
             slot = warm_slot(step)
             cache_key = _solver_cache_key(step)
+            # legacy batch 路径下，先带锁查一下全局 solver cache；
+            # 一旦拿到 cached，这个 idx 的 update/solve 就不再持锁，各 step 仍然各管各的。
             cached = lock(_STEP_SOLVER_CACHE_LOCK) do
                 get(_STEP_SOLVER_CACHE, cache_key, nothing)
             end
@@ -1348,6 +1116,7 @@ function solve_batch_payload(
                     acceptable_iter = acceptable_iter,
                     tol = tol,
                 )
+                # 只有把新建 solver 放进全局 cache 的瞬间才加锁。
                 cached = lock(_STEP_SOLVER_CACHE_LOCK) do
                     get!(_STEP_SOLVER_CACHE, cache_key, new_cached)
                 end
@@ -1489,6 +1258,257 @@ function solve_batch_payload(
         out["results"] = results
     end
     return out
+end
+
+# -----------------------------------------------------------------------------
+# 以下代码不是当前稳定主线的必经路径，统一收在 solve_batch_payload(...) 后面：
+# - update_parameterized_step!           # legacy 单 step JSON 路径
+# - solve_cached_step!                  # 完整返回/调试版本
+# - _solve_with_rebuild_fallback!       # legacy 路径重建兜底
+# - prepare_batch_payload!              # 预热/诊断入口
+# - solve_batch(path) / main()          # CLI / 文件兼容入口
+# -----------------------------------------------------------------------------
+
+# 旧路径：每个 step 都是完整 JSON step 对象。
+# 这条路径更直观，但运行时会有更多对象构造和字段拆装开销。
+function update_parameterized_step!(cached::CachedStepSolver, step::SubP2StepModel.StepData)
+    p = step.params
+    refs = cached.params
+    set_parameter_value(refs.rho_lx, Float64(p["rho_lx"]))
+    set_parameter_value(refs.rho_lu, Float64(p["rho_lu"]))
+    set_parameter_value(refs.rho_ix, Float64(p["rho_ix"]))
+    set_parameter_value(refs.rho_iu, Float64(p["rho_iu"]))
+    set_parameter_value(refs.is_terminal, Float64(p["is_terminal"]))
+    _set_param_vec!(refs.xl_ideal, as_vec(p["xl_ideal"]))
+    _set_param_vec!(refs.ul_ideal, as_vec(p["ul_ideal"]))
+    _set_param_vec!(refs.y_xl, as_vec(p["y_xl"]))
+    _set_param_vec!(refs.y_ul, as_vec(p["y_ul"]))
+    _set_param_mat!(refs.xc_ideal, as_mat(p["xc_ideal"]))
+    _set_param_mat!(refs.uc_ideal, as_mat(p["uc_ideal"]))
+    _set_param_mat!(refs.y_xc, as_mat(p["y_xc"]))
+    _set_param_mat!(refs.y_uc, as_mat(p["y_uc"]))
+    _set_param_mat!(refs.Pt, as_mat(p["Pt"]))
+    _set_param_vec!(refs.pob1, as_vec(p["pob1"]))
+    _set_param_vec!(refs.pob2, as_vec(p["pob2"]))
+    _set_param_mat!(refs.ra, transpose(as_mat(p["ra"])))
+    set_parameter_value(refs.ro, Float64(p["ro"]))
+    set_parameter_value(refs.rq, Float64(p["rq"]))
+    set_parameter_value(refs.cl0, Float64(p["cl0"]))
+    set_parameter_value(refs.rl, Float64(p["rl"]))
+    set_parameter_value(refs.t_min, Float64(p["t_min"]))
+    set_parameter_value(refs.t_max, Float64(p["t_max"]))
+    set_parameter_value(refs.ui_bound, Float64(p["ui_bound"]))
+    set_parameter_value(refs.g, Float64(p["g"]))
+    set_parameter_value(refs.ml, Float64(p["ml"]))
+    set_parameter_value(refs.mq, Float64(p["mq"]))
+    set_parameter_value(refs.fmax, Float64(p["fmax"]))
+    _set_param_mat!(refs.Jl, as_mat(p["Jl"]))
+    _set_param_mat!(refs.Jl_inv, as_mat(p["Jl_inv"]))
+    cached.step = step
+    return nothing
+end
+
+# 单步求解的完整返回版本。
+# 适合 legacy 路径或者调试时保留更多字段。
+function solve_cached_step!(
+    cached::CachedStepSolver;
+    slot::Int = 0,
+    max_iter = 200,
+    acceptable_tol = 1e-4,
+    acceptable_iter = 5,
+    tol = 1e-8,
+    runtime_only::Bool = false,
+    runtime_metric_mode::Symbol = :full,
+)
+    set_solver_options!(
+        cached;
+        max_iter = max_iter,
+        acceptable_tol = acceptable_tol,
+        acceptable_iter = acceptable_iter,
+        tol = tol,
+    )
+    warm_sol = cached.warm_slot_id == slot ? cached.warm_solution : nothing
+    if warm_sol !== nothing
+        _set_start_values!(cached.xrefs, warm_sol)
+    else
+        _set_start_values!(cached.xrefs, cached.step.x_init)
+    end
+    optimize!(cached.model)
+    x_sol = _read_solution(cached.xrefs)
+    _store_warm_solution!(cached, slot, x_sol)
+    metrics = if runtime_only
+        if runtime_metric_mode == :none
+            (
+                eq_inf = nothing,
+                ineq_vio = nothing,
+            )
+        else
+            eq_vec = Float64.(equality_residual(x_sol, cached.step.params, cached.step.dims))
+            ineq_vec = Float64.(inequality_residual(x_sol, cached.step.params, cached.step.dims))
+            (
+                eq_inf = maximum(abs.(eq_vec)),
+                ineq_vio = maximum(max.(ineq_vec, 0.0)),
+            )
+        end
+    else
+        summarize_solution(cached.step, x_sol)
+    end
+    status = string(termination_status(cached.model))
+    primal = string(primal_status(cached.model))
+    iter = _optimizer_iter_count(cached.model)
+    result = Dict(
+        "status" => status,
+        "primal_status" => primal,
+        "iter" => iter,
+        "eq_inf" => metrics.eq_inf,
+        "ineq_vio" => metrics.ineq_vio,
+        "include_simple_ineq" => true,
+        "x_sol" => x_sol,
+    )
+    if !runtime_only
+        result["objective"] = metrics.objective
+        result["orig_rmse"] = metrics.orig_rmse
+        result["orig_max_abs"] = metrics.orig_max_abs
+    end
+    return result
+end
+
+# 如果某个 cached solver 因内部状态问题求解失败，
+# 这里会重建同结构 solver 再重试一次，尽量不让整个 batch 因单个槽位脏掉而崩盘。
+function _solve_with_rebuild_fallback!(
+    cached::CachedStepSolver,
+    step::SubP2StepModel.StepData,
+    cache_key;
+    slot::Int,
+    max_iter,
+    acceptable_tol,
+    acceptable_iter,
+    tol,
+    runtime_only::Bool = false,
+    runtime_metric_mode::Symbol = :full,
+)
+    try
+        cached.step = step
+        return solve_cached_step!(
+            cached;
+            slot = slot,
+            max_iter = max_iter,
+            acceptable_tol = acceptable_tol,
+            acceptable_iter = acceptable_iter,
+            tol = tol,
+            runtime_only = runtime_only,
+            runtime_metric_mode = runtime_metric_mode,
+        )
+    catch err
+        if !(err isa Exception)
+            rethrow(err)
+        end
+        rebuilt = build_cached_step_solver(
+            step;
+            print_level = MadNLP.ERROR,
+            include_simple_ineq = true,
+            max_iter = max_iter,
+            acceptable_tol = acceptable_tol,
+            acceptable_iter = acceptable_iter,
+            tol = tol,
+        )
+        _copy_warm_solution!(rebuilt, cached, slot)
+        # fallback 时才需要替换全局 solver cache 条目，所以这里只在字典写回时加锁。
+        # 真正的 solve_cached_step! 仍然发生在锁外。
+        cached = lock(_STEP_SOLVER_CACHE_LOCK) do
+            _STEP_SOLVER_CACHE[cache_key] = rebuilt
+            rebuilt
+        end
+        cached.step = step
+        result = solve_cached_step!(
+            cached;
+            slot = slot,
+            max_iter = max_iter,
+            acceptable_tol = acceptable_tol,
+            acceptable_iter = acceptable_iter,
+            tol = tol,
+            runtime_only = runtime_only,
+            runtime_metric_mode = runtime_metric_mode,
+        )
+        result["rebuilt_after_failure"] = true
+        return result
+    end
+end
+
+# prepare_batch_payload! 的作用不是求解，而是把模型骨架提前预热好。
+# 这样 Python 可以把"首次建模板"成本和真正 solve 成本拆开看。
+function prepare_batch_payload!(
+    data;
+    max_iter = 200,
+    acceptable_tol = 1e-4,
+    acceptable_iter = 5,
+    tol = 1e-8,
+)
+    if !_has_stacked_runtime_format(data)
+        # ---------------------------
+        # 可先跳过：legacy path
+        # ---------------------------
+        # 这条路径处理的是“每个 step 都是独立 JSON 对象”的旧格式。
+        # 当前 Python/JAX 正式主线默认不会走这里。
+        steps = data["steps"]
+        count = length(steps)
+        t0 = time_ns()
+        built = 0
+        for step_json in steps
+            step = SubP2StepModel.step_data_from_json(step_json)
+            cache_key = _solver_cache_key(step)
+            # legacy prepare 路径下，先带锁查一下全局 solver cache；
+            # 这里的锁只覆盖字典访问，不覆盖后面的模型构造或求解。
+            cached = lock(_STEP_SOLVER_CACHE_LOCK) do
+                get(_STEP_SOLVER_CACHE, cache_key, nothing)
+            end
+            if cached === nothing
+                new_cached = build_cached_step_solver(
+                    step;
+                    print_level = MadNLP.ERROR,
+                    include_simple_ineq = true,
+                    max_iter = max_iter,
+                    acceptable_tol = acceptable_tol,
+                    acceptable_iter = acceptable_iter,
+                    tol = tol,
+                )
+                # 只有首次把 solver 放回全局 cache 时才需要锁。
+                lock(_STEP_SOLVER_CACHE_LOCK) do
+                    get!(_STEP_SOLVER_CACHE, cache_key, new_cached)
+                end
+                built += 1
+            end
+        end
+        return Dict(
+            "count" => count,
+            "built" => built,
+            "prepare_ms" => (time_ns() - t0) / 1e6,
+            "mode" => "legacy_exact_cache",
+        )
+    end
+
+    # 当前正式主线的 prepare 只是预热 stacked template。
+    x_init_batch = _getkey(data, "x_init_batch")
+    nsteps = length(x_init_batch)
+    dims = Tuple(Int(v) for v in _getkey(data, "dims"))
+    target_steps = _getkey(data, "target_steps")
+    t0 = time_ns()
+    _ensure_stacked_batch_template!(
+        data,
+        dims,
+        target_steps,
+        nsteps;
+        max_iter = max_iter,
+        acceptable_tol = acceptable_tol,
+        acceptable_iter = acceptable_iter,
+        tol = tol,
+    )
+    return Dict(
+        "count" => nsteps,
+        "built" => nsteps,
+        "prepare_ms" => (time_ns() - t0) / 1e6,
+        "mode" => "stacked_runtime_template",
+    )
 end
 
 # CLI / 文件路径兼容入口。

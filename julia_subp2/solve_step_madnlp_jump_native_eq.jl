@@ -65,6 +65,14 @@ function summarize_solution(step::SubP2StepModel.StepData, x_sol::Vector{Float64
     )
 end
 
+# -----------------------------------------------------------------------------
+# 以下代码不是当前稳定 batch 主线的必经路径，统一收在 summarize_solution(...) 后面：
+# - add_native_objective!(...)        # 单步参考目标
+# - build_jump_model_eq(...)          # 单步完整 JuMP 模型
+# - solve_step_data(...)              # 单步离线求解入口
+# - solve_step(path) / main()         # JSON / CLI 包装层
+# -----------------------------------------------------------------------------
+
 # 单步模型的原始目标函数实现。
 # 这条更偏向"单步参考模型"，当前 batch 主线并不直接调用这里，
 # 因为 batch 主线走的是 solve_batch_madnlp_jump_native.jl 里的参数化模型版本。
@@ -123,8 +131,17 @@ end
 # 单步 SubP2 的完整 JuMP 模型。
 # 这更像"参考/离线"版本：直接从一个 StepData 把模型一次性建出来。
 #
-# 当前正式 batch 主线不直接调用它，而是使用 batch 文件里的参数化缓存模型。
-# 但如果你想看"一个 step 的 NLP 本体"，这个函数很值得读。
+# 当前正式 batch 主线不直接调用它，而是使用 solve_batch_madnlp_jump_native.jl
+# 里的 build_jump_model_eq_parameterized(...)。
+# 两者的关系是：
+# - 这里：把 step.params 里的数值直接写死进模型，适合单步离线复现和读模型本体
+# - 那边：把会变的量建成 JuMP Parameter，适合 batch/cache/warm-start 主线
+# - 两边表达的是同一个单步 NLP，本体约束和目标应当保持一致
+# 但工程组织不同：
+# - 这里强调“单步可读、一次性建模”
+# - 那边强调“参数化复用、少重建、适合 100+ step 批量求解”
+# 所以如果你想看"当前主线真正怎么跑"，优先看参数化版本；
+# 如果你想看"单步问题本体长什么样"，这个函数更直观。
 function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq::Bool = true)
     model = Model()
     nxl, nul, nxi, nui, nq, _ = step.dims
