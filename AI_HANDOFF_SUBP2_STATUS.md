@@ -43,7 +43,7 @@ reproduction instead of relying on the Julia default scheduler.
 Current main files:
 
 - `JustWorkingOnIt.py`
-- `python_archive/run_julia_subp2_fullflow_persistent.py`
+- `run_julia_subp2_fullflow_persistent.py`
 - `julia_subp2/solve_batch_madnlp_jump_native.jl`
 - `julia_subp2/worker_batch_madnlp_jump_native.jl`
 - `verify_jax_vs_original.py`
@@ -68,7 +68,7 @@ Main benchmark definition:
 Formal benchmark command:
 
 ```bash
-MPLBACKEND=Agg MPLCONFIGDIR=/tmp/mpl VERIFY_TASK_IDX=0 VERIFY_HORIZON=100 VERIFY_ADMM_ITERS=3 JAX_PLATFORMS=cpu /home/mpc/miniconda3/envs/xirui/bin/python -u python_archive/run_julia_subp2_fullflow_persistent.py --task-idx 0 --repeats 2 --julia-threads 20 --julia-blas-threads 1 --julia-linear-solver mumps --julia-kkt-system default --julia-callback default --julia-thread-schedule static
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/mpl VERIFY_TASK_IDX=0 VERIFY_HORIZON=100 VERIFY_ADMM_ITERS=3 JAX_PLATFORMS=cpu /home/mpc/miniconda3/envs/xirui/bin/python -u run_julia_subp2_fullflow_persistent.py --task-idx 0 --repeats 2 --julia-threads 20 --julia-blas-threads 1 --julia-linear-solver mumps --julia-kkt-system default --julia-callback default --julia-thread-schedule static
 ```
 
 Interpret this command as the confirmed stable benchmark target. If a run uses a

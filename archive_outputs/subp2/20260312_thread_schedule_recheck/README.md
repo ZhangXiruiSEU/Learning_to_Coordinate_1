@@ -9,7 +9,7 @@ Stable mainline files that remain in place and should be treated as active:
 
 - `JustWorkingOnIt.py`
 - `verify_jax_vs_original.py`
-- `python_archive/run_julia_subp2_fullflow_persistent.py`
+- `run_julia_subp2_fullflow_persistent.py`
 - `julia_subp2/solve_batch_madnlp_jump_native.jl`
 - `julia_subp2/worker_batch_madnlp_jump_native.jl`
 

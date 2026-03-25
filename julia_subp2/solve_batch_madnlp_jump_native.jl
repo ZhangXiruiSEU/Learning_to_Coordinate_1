@@ -24,6 +24,48 @@ include("step_model.jl")
 using .SubP2StepModel
 include("solve_step_madnlp_jump_native_eq.jl")
 
+# -----------------------------------------------------------------------------
+# 这个文件是 Julia 侧 SubP2 的总调度中心。
+#
+# 当前主线真正走的是：
+#   Python -> persistent worker -> solve_batch_payload(data; result_format=:stacked...)
+#   -> stacked runtime template cache -> Threads.@threads 并行解每个 step
+#
+# 因此，这里同时承担了四类职责：
+# 1. backend / 线程调度配置
+# 2. 单步 JuMP/MadNLP 模型缓存
+# 3. stacked batch 参数更新与并行求解
+# 4. CLI / 文件输入兼容
+#
+# 当前主线的必经调用链可以直接按这个顺序追：
+# solve_batch_payload (stacked path)
+#   -> _ensure_stacked_batch_template!
+#   -> solve_one_stacked(idx)
+#   -> _solve_stacked_cached_step!
+#   -> update_parameterized_step_from_stacked!
+#   -> solve_cached_step_compact!
+# 如果你现在只是想读懂“当前正式主线到底怎么跑”，最小阅读顺序是：
+# 1. solve_batch_payload(...)               # 看 stacked path，而不是 legacy path
+# 2. _ensure_stacked_batch_template!(...)   # 看模板/缓存是怎么准备的
+# 3. _solve_stacked_cached_step!(...)       # 看单个 step 在 batch 中如何被执行
+# 4. update_parameterized_step_from_stacked!(...)
+#                                          # 看每轮 ADMM / 每个 step 真正更新了哪些参数
+# 5. solve_cached_step_compact!(...)        # 看单步 solve + warm start + 紧凑回包
+# 6. build_cached_step_solver(...)          # 看缓存槽位首次如何构建
+# 7. build_jump_model_eq_parameterized(...) # 最后再看单步 NLP 模型本体
+#
+# 可以先跳过的内容：
+# - update_parameterized_step!(...)         # legacy JSON step 路径
+# - prepare_batch_payload!(...)             # 预热/诊断入口
+# - solve_batch(path) / main()              # CLI / 文件模式
+# - GPU outer serial 分支                   # 当前 CPU 主线默认不走
+# -----------------------------------------------------------------------------
+
+# 每个 step 对应一个可复用的 solver 槽位。
+# 缓存里除了 model 本身，还保存：
+# - 参数引用（便于 set_parameter_value）
+# - warm start 解向量
+# - 最近一次 solver 选项
 mutable struct CachedStepSolver
     step::SubP2StepModel.StepData
     model
@@ -43,6 +85,7 @@ const _STEP_SOLVER_CACHE_LOCK = ReentrantLock()
 const _STACKED_BATCH_TEMPLATE_CACHE = Dict{Any, Vector{CachedStepSolver}}()
 const _STACKED_BATCH_TEMPLATE_CACHE_LOCK = ReentrantLock()
 
+# 结构缓存键只区分"问题结构"，不区分当前轮次的参数值。
 function structure_cache_key(step::SubP2StepModel.StepData)
     return string(step.dims, "|ineq=true")
 end
@@ -76,6 +119,7 @@ function _gpu_linear_solver_enabled()
     return cfg.linear_solver_name in ("lapackcuda", "cudss")
 end
 
+# GPU 外层模式只影响"step 级并行"怎么分发，不改变单步模型定义。
 function _gpu_outer_mode()
     mode = lowercase(strip(get(ENV, "JULIA_SUBP2_GPU_OUTER_MODE", "serial")))
     mode in ("serial", "threaded") || error("unsupported JULIA_SUBP2_GPU_OUTER_MODE=$(mode)")
@@ -86,6 +130,8 @@ function _thread_schedule_name()
     return lowercase(strip(get(ENV, "JULIA_SUBP2_THREAD_SCHEDULE", "default")))
 end
 
+# step 级并行的统一入口。
+# 当前 CPU 主线就是把 batch 中的 n 个 step 丢给这里按线程调度。
 function _run_threaded_range!(f, n::Int)
     sched = _thread_schedule_name()
     if sched == "dynamic"
@@ -156,6 +202,8 @@ function _configure_madnlp_backend!(model::Model)
     end
 end
 
+# 下面三个 helper 用 JuMP Parameter 构造"可更新参数"，
+# 这样后面每轮 ADMM 只改参数，不重建模型。
 function _build_param_scalar(model, name::Symbol, value::Float64)
     pref = @variable(model, base_name = string(name), set = Parameter(value))
     model[name] = pref
@@ -180,6 +228,8 @@ function _build_param_mat(model, name::Symbol, values::AbstractMatrix{<:Real})
     return p
 end
 
+# 为单步 SubP2 构造参数化一致性目标。
+# 对应 Python/ADMM 传过来的 ideal primal / dual / rho。
 function add_native_objective_parameterized!(model::Model, x, dims)
     nxl, nul, nxi, nui, nq, _ = dims
 
@@ -250,6 +300,14 @@ function add_native_objective_parameterized!(model::Model, x, dims)
     )
 end
 
+# 构造单步 SubP2 的 JuMP/MadNLP 模型。
+#
+# 决策变量 x 的布局是：
+# - 负载状态 xl
+# - 负载控制 ul
+# - 每架无人机对应的缆绳状态/控制块
+#
+# 这里建的是"结构固定、参数可更新"的模型骨架。
 function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = true)
     model = Model(MadNLP.Optimizer)
     set_silent(model)
@@ -279,6 +337,7 @@ function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = tru
     active_u = 1.0 - obj_params.is_terminal
     eps_margin = 1e-2
 
+    # 由负载四元数显式展开旋转矩阵，后续多处约束都会复用。
     q0 = x[7]; q1 = x[8]; q2 = x[9]; q3 = x[10]
     @expression(model, R11, 2 * (q0^2 + q1^2) - 1)
     @expression(model, R12, 2 * (q1 * q2 - q0 * q3))
@@ -295,10 +354,12 @@ function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = tru
         R31 R32 R33;
     ]
 
+    # 负载四元数单位模约束。
     @constraint(model, q0^2 + q1^2 + q2^2 + q3^2 == 1.0)
 
     base = nxl + nul
     stride = nxi + nui
+    # 每根缆绳方向向量也要求保持单位长度。
     for i in 1:nq
         off = base + (i - 1) * stride
         d1 = x[off + 1]
@@ -307,6 +368,7 @@ function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = tru
         @constraint(model, d1^2 + d2^2 + d3^2 == 1.0)
     end
 
+    # 每根缆绳张力在负载机体系中的表达，后面用于合力/合矩一致性。
     @expression(model, fi_b1[i = 1:nq],
         R11 * (x[base + (i - 1) * stride + 1] * x[base + (i - 1) * stride + 13]) +
         R21 * (x[base + (i - 1) * stride + 2] * x[base + (i - 1) * stride + 13]) +
@@ -323,6 +385,7 @@ function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = tru
         R33 * (x[base + (i - 1) * stride + 3] * x[base + (i - 1) * stride + 13])
     )
 
+    # 6 维 wrench 一致性：所有缆绳合起来的受力/力矩，要匹配负载控制量。
     for r in 1:6
         expr = 0.0
         col = 1
@@ -339,6 +402,14 @@ function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = tru
         @constraint(model, active_u * (expr - target) == 0.0)
     end
 
+    # 下面是主要不等式约束：
+    # - 负载避障
+    # - 无人机避障
+    # - 张力上下界
+    # - 控制上下界
+    # - 机间碰撞约束
+    # - 绳索/负载几何约束
+    # - 推力幅值上下界
     if include_simple_ineq
         safe_r_l = ro + 0.5 * rq
         @constraint(model, safe_r_l^2 + eps_margin - ((x[1] - pob1[1])^2 + (x[2] - pob1[2])^2) <= 0.0)
@@ -445,6 +516,11 @@ function build_jump_model_eq_parameterized(dims; include_simple_ineq::Bool = tru
     return model, x, params
 end
 
+# 以下 helper 分成两类：
+# 1. set_parameter_value / set_start_value 的轻量循环
+# 2. 轻量 copy / compare，用来尽量少做无意义更新
+#
+# 这是热路径里的细活，存在的原因就是减少 JuMP 参数更新开销。
 function _set_param_vec!(pref, values)
     @inbounds for i in eachindex(pref)
         set_parameter_value(pref[i], Float64(values[i]))
@@ -594,6 +670,8 @@ function _set_static_mat_if_changed!(params, name::String, pref, src)
     return nothing
 end
 
+# 旧路径：每个 step 都是完整 JSON step 对象。
+# 这条路径更直观，但运行时会有更多对象构造和字段拆装开销。
 function update_parameterized_step!(cached::CachedStepSolver, step::SubP2StepModel.StepData)
     p = step.params
     refs = cached.params
@@ -631,6 +709,13 @@ function update_parameterized_step!(cached::CachedStepSolver, step::SubP2StepMod
     return nothing
 end
 
+# 主线路径：从 stacked runtime payload 中，按 idx 原地更新一个 cached step。
+#
+# 这里专门把"动态参数"和"静态参数"拆开：
+# - 动态参数：每轮 ADMM / 每个 step 常变，直接刷新
+# - 静态参数：多数时候不变，只有变化时才 set_parameter_value
+#
+# 这也是当前 Julia 热路径优化最核心的一层。
 function update_parameterized_step_from_stacked!(cached::CachedStepSolver, data, idx::Int)
     params_batch = _getkey(data, "params_batch")
     refs = cached.params
@@ -699,6 +784,9 @@ function update_parameterized_step_from_stacked!(cached::CachedStepSolver, data,
     return nothing
 end
 
+# 从一个 step data 构造"可长期复用"的 solver 槽位。
+# 注意这里做的是：建模型、绑定参数引用、配 solver 选项、首次写入参数，
+# 而不是立刻求解。
 function build_cached_step_solver(
     step::SubP2StepModel.StepData;
     include_simple_ineq::Bool = true,
@@ -732,6 +820,7 @@ function build_cached_step_solver(
     return cached
 end
 
+# solver 选项也走"只在变化时更新"，避免每轮反复 set optimizer attribute。
 function set_solver_options!(
     cached::CachedStepSolver;
     max_iter = 200,
@@ -758,6 +847,8 @@ function set_solver_options!(
     return nothing
 end
 
+# warm slot 本质上就是"这个解属于哪个 time step 的 warm start"。
+# 当前实现不是多槽 stage cache，而是单槽缓存。
 function warm_slot(step::SubP2StepModel.StepData)
     meta = step.meta
     if meta isa AbstractDict
@@ -770,6 +861,8 @@ function warm_slot(step::SubP2StepModel.StepData)
     return 0
 end
 
+# 单步求解的完整返回版本。
+# 适合 legacy 路径或者调试时保留更多字段。
 function solve_cached_step!(
     cached::CachedStepSolver;
     slot::Int = 0,
@@ -833,6 +926,8 @@ function solve_cached_step!(
     return result
 end
 
+# 单步求解的紧凑返回版本。
+# 当前 Python 主线更偏向用这条，因为回包更小、重建更轻。
 function solve_cached_step_compact!(
     cached::CachedStepSolver;
     slot::Int = 0,
@@ -871,6 +966,8 @@ function _solver_cache_key(slot::Int, dims::NTuple{6, Int})
     return (slot, string(structure_cache_key(dims), "|", _backend_key()))
 end
 
+# 如果某个 cached solver 因内部状态问题求解失败，
+# 这里会重建同结构 solver 再重试一次，尽量不让整个 batch 因单个槽位脏掉而崩盘。
 function _solve_with_rebuild_fallback!(
     cached::CachedStepSolver,
     step::SubP2StepModel.StepData,
@@ -929,6 +1026,8 @@ function _solve_with_rebuild_fallback!(
     end
 end
 
+# stacked_runtime_v1 是当前 Python/JAX -> Julia 主线使用的 payload 协议。
+# 它不是 101 个 step 的 Dict 列表，而是把所有 step 的 x_init / params 按 batch 组织起来。
 function _has_stacked_runtime_format(data)
     fmt = if haskey(data, "format")
         String(data["format"])
@@ -952,6 +1051,8 @@ function _metric_or_jsonable(value)
     return value === nothing ? nothing : Float64(value)
 end
 
+# 把 stacked payload 的第 idx 个切片重新包装成一个 StepData。
+# 这个函数主要用于"首次建模板"阶段，而不是每轮热路径都频繁新建对象。
 function step_data_from_stacked_payload(data, idx::Int)
     dims = Tuple(Int(v) for v in _getkey(data, "dims"))
     meta0 = _getkey(data, "meta")
@@ -984,6 +1085,8 @@ function step_data_from_stacked_payload(data, idx::Int)
     )
 end
 
+# 为某个 (nsteps, dims, backend) 组合准备一整批 template。
+# 后续每轮 stacked solve 直接复用这批模板，只改参数和 warm start。
 function _ensure_stacked_batch_template!(
     data,
     dims::NTuple{6, Int},
@@ -1021,6 +1124,8 @@ function _ensure_stacked_batch_template!(
     end
 end
 
+# prepare_batch_payload! 的作用不是求解，而是把模型骨架提前预热好。
+# 这样 Python 可以把"首次建模板"成本和真正 solve 成本拆开看。
 function prepare_batch_payload!(
     data;
     max_iter = 200,
@@ -1029,6 +1134,11 @@ function prepare_batch_payload!(
     tol = 1e-8,
 )
     if !_has_stacked_runtime_format(data)
+        # ---------------------------
+        # 可先跳过：legacy path
+        # ---------------------------
+        # 这条路径处理的是“每个 step 都是独立 JSON 对象”的旧格式。
+        # 当前 Python/JAX 正式主线默认不会走这里。
         steps = data["steps"]
         count = length(steps)
         t0 = time_ns()
@@ -1063,6 +1173,20 @@ function prepare_batch_payload!(
         )
     end
 
+    # ---------------------------
+    # 当前正式主线从这里开始：
+    # - 读取 stacked batch
+    # - 复用 template
+    # - 按 step 并行 solve
+    # - 返回紧凑 batch 结果
+    # ---------------------------
+    # 当前主线的必经调用链可以直接按这个顺序追：
+    # solve_batch_payload (stacked path)
+    #   -> _ensure_stacked_batch_template!
+    #   -> solve_one_stacked(idx)
+    #   -> _solve_stacked_cached_step!
+    #   -> update_parameterized_step_from_stacked!
+    #   -> solve_cached_step_compact!
     x_init_batch = _getkey(data, "x_init_batch")
     nsteps = length(x_init_batch)
     dims = Tuple(Int(v) for v in _getkey(data, "dims"))
@@ -1086,6 +1210,9 @@ function prepare_batch_payload!(
     )
 end
 
+# 用一个现成 template[idx] 去解当前 batch 的第 idx 个 step。
+# 主线路径里真正的热工作就是：
+#   update_parameterized_step_from_stacked! -> solve_cached_step_compact!
 function _solve_stacked_cached_step!(
     template::Vector{CachedStepSolver},
     idx::Int,
@@ -1175,6 +1302,13 @@ function _solve_stacked_cached_step!(
     end
 end
 
+# 这是 Julia 侧 batch 求解的总入口。
+#
+# 文件里同时保留了两条路径：
+# 1. legacy path: data["steps"] = 每个 step 一个独立 JSON 对象
+# 2. stacked path: 当前主线，批量 x_init / params，紧凑回包
+#
+# 真正日常主线看 stacked path 就够了。
 function solve_batch_payload(
     data;
     max_iter = 200,
@@ -1185,6 +1319,11 @@ function solve_batch_payload(
     result_format::Symbol = :default,
 )
     if !_has_stacked_runtime_format(data)
+        # ---------------------------
+        # 可先跳过：legacy path
+        # ---------------------------
+        # 这条路径处理的是“每个 step 都是独立 JSON 对象”的旧格式。
+        # 当前 Python/JAX 正式主线默认不会走这里。
         steps = data["steps"]
         results = Vector{Any}(undef, length(steps))
         t0 = time_ns()
@@ -1236,6 +1375,7 @@ function solve_batch_payload(
             results[idx] = result
             return nothing
         end
+        # 这里仍然是按 step 并行；GPU 某些模式下才会退回外层串行。
         if _gpu_linear_solver_enabled() && _gpu_outer_mode() == "serial"
             for idx in eachindex(steps)
                 solve_one_step(idx)
@@ -1253,6 +1393,20 @@ function solve_batch_payload(
         )
     end
 
+    # ---------------------------
+    # 当前正式主线从这里开始：
+    # - 读取 stacked batch
+    # - 复用 template
+    # - 按 step 并行 solve
+    # - 返回紧凑 batch 结果
+    # ---------------------------
+    # 当前主线的必经调用链可以直接按这个顺序追：
+    # solve_batch_payload (stacked path)
+    #   -> _ensure_stacked_batch_template!
+    #   -> solve_one_stacked(idx)
+    #   -> _solve_stacked_cached_step!
+    #   -> update_parameterized_step_from_stacked!
+    #   -> solve_cached_step_compact!
     x_init_batch = _getkey(data, "x_init_batch")
     nsteps = length(x_init_batch)
     dims = Tuple(Int(v) for v in _getkey(data, "dims"))
@@ -1309,6 +1463,8 @@ function solve_batch_payload(
         end
         return nothing
     end
+    # CPU 主线默认在这里做 step 级并行。
+    # 只有少数 GPU 线性求解器模式才会强制退回外层串行。
     if _gpu_linear_solver_enabled() && _gpu_outer_mode() == "serial"
         for idx in 1:nsteps
             solve_one_stacked(idx)
@@ -1335,6 +1491,9 @@ function solve_batch_payload(
     return out
 end
 
+# CLI / 文件路径兼容入口。
+# persistent worker 平时更常走 solve_batch_payload(data)，
+# 但这里保留直接读 JSON 文件求解的能力，便于离线排查。
 function solve_batch(
     path::String;
     max_iter = 200,
@@ -1356,6 +1515,8 @@ function solve_batch(
     )
 end
 
+# 这个 main 主要给"直接命令行跑单个 batch.json"使用。
+# persistent worker 模式并不会从这里进，而是 include 本文件后直接调用 solve_batch_payload。
 function main()
     if length(ARGS) < 1
         error("usage: julia julia_subp2/solve_batch_madnlp_jump_native.jl <batch.json> [out.json] [--max-iter=N] [--acceptable-tol=X] [--acceptable-iter=N] [--tol=X]")

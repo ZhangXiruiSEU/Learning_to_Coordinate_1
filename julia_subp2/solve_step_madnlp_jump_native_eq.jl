@@ -20,10 +20,39 @@ using .SubP2StepModel: as_vec,
     gio_terms_indexed,
     thrust_terms_indexed
 
+# -----------------------------------------------------------------------------
+# 这个文件主要是"单步 SubP2" 的 JuMP/MadNLP 参考实现。
+#
+# 它和 solve_batch_madnlp_jump_native.jl 的关系是：
+# - 当前 batch 主线真正直接复用的，主要只有 summarize_solution(...)
+# - 其余大部分函数更偏向：
+#   - 单步离线调试
+#   - 快照/JSON 复现
+#   - 早期单步验证路径
+#
+# 如果你现在只关心"当前正式 batch 主线"，最小阅读顺序是：
+# 1. summarize_solution(...)               # 当前主线直接会用到
+# 2. 其余函数可以先跳过
+#
+# 如果你想理解"单个 step 的原始 JuMP 模型长什么样"，再读：
+# 1. add_native_objective!(...)
+# 2. build_jump_model_eq(...)
+# 3. solve_step_data(...)
+#
+# 当前主线中可先跳过的部分：
+# - build_jump_model_eq(...)               # batch 主线不直接调用
+# - solve_step_data(...)                   # 单步离线求解入口
+# - solve_step(path)                       # 文件路径包装层
+# - main()                                # CLI 入口
+# -----------------------------------------------------------------------------
+
+# 轻量 RMSE helper，只给 summarize_solution(...) 用。
 function rmse(a::AbstractVector, b::AbstractVector)
     return sqrt(sum(abs2, a .- b) / length(a))
 end
 
+# 当前 batch 主线直接会用到这个函数。
+# 作用：把单步求解结果压缩成几个对比指标，供 Python/Julia 上层诊断使用。
 function summarize_solution(step::SubP2StepModel.StepData, x_sol::Vector{Float64})
     eq_vec = Float64.(equality_residual(x_sol, step.params, step.dims))
     ineq_vec = Float64.(inequality_residual(x_sol, step.params, step.dims))
@@ -36,6 +65,9 @@ function summarize_solution(step::SubP2StepModel.StepData, x_sol::Vector{Float64
     )
 end
 
+# 单步模型的原始目标函数实现。
+# 这条更偏向"单步参考模型"，当前 batch 主线并不直接调用这里，
+# 因为 batch 主线走的是 solve_batch_madnlp_jump_native.jl 里的参数化模型版本。
 function add_native_objective!(model::Model, x, step::SubP2StepModel.StepData)
     nxl, nul, nxi, nui, nq, _ = step.dims
     active_u = 1.0 - Float64(step.params["is_terminal"])
@@ -88,6 +120,11 @@ function add_native_objective!(model::Model, x, step::SubP2StepModel.StepData)
     @objective(model, Min, obj_lx + obj_lu + obj_xc + obj_uc)
 end
 
+# 单步 SubP2 的完整 JuMP 模型。
+# 这更像"参考/离线"版本：直接从一个 StepData 把模型一次性建出来。
+#
+# 当前正式 batch 主线不直接调用它，而是使用 batch 文件里的参数化缓存模型。
+# 但如果你想看"一个 step 的 NLP 本体"，这个函数很值得读。
 function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq::Bool = true)
     model = Model()
     nxl, nul, nxi, nui, nq, _ = step.dims
@@ -115,6 +152,7 @@ function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq:
     Jl = as_mat(step.params["Jl"])
     Jl_inv = as_mat(step.params["Jl_inv"])
 
+    # 由负载四元数显式展开旋转矩阵，后续很多约束都会复用。
     q0 = x[7]; q1 = x[8]; q2 = x[9]; q3 = x[10]
     @expression(model, R11, 2 * (q0^2 + q1^2) - 1)
     @expression(model, R12, 2 * (q1 * q2 - q0 * q3))
@@ -131,10 +169,12 @@ function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq:
         R31 R32 R33;
     ]
 
+    # 负载四元数单位模约束。
     @constraint(model, q0^2 + q1^2 + q2^2 + q3^2 == 1.0)
 
     base = nxl + nul
     stride = nxi + nui
+    # 每根缆绳方向向量也要求保持单位长度。
     for i in 1:nq
         off = base + (i - 1) * stride
         d1 = x[off + 1]
@@ -143,6 +183,7 @@ function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq:
         @constraint(model, d1^2 + d2^2 + d3^2 == 1.0)
     end
 
+    # 每根缆绳张力在负载机体系中的表达，后面用于合力/合矩一致性。
     @expression(model, fi_b1[i = 1:nq],
         R11 * (x[base + (i - 1) * stride + 1] * x[base + (i - 1) * stride + 13]) +
         R21 * (x[base + (i - 1) * stride + 2] * x[base + (i - 1) * stride + 13]) +
@@ -159,6 +200,7 @@ function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq:
         R33 * (x[base + (i - 1) * stride + 3] * x[base + (i - 1) * stride + 13])
     )
 
+    # 6 维 wrench 一致性：所有缆绳的合力/合矩，要和负载控制量匹配。
     for r in 1:6
         expr = 0.0
         col = 1
@@ -175,6 +217,14 @@ function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq:
         @constraint(model, active_u * (expr - target) == 0.0)
     end
 
+    # 主要不等式约束：
+    # - 负载避障
+    # - 无人机避障
+    # - 张力上下界
+    # - 控制上下界
+    # - 机间碰撞约束
+    # - 绳索/负载几何约束
+    # - 推力幅值上下界
     if include_simple_ineq
         safe_r_l = ro + 0.5 * rq
         @constraint(model, safe_r_l^2 + eps_margin - ((x[1] - pob1[1])^2 + (x[2] - pob1[2])^2) <= 0.0)
@@ -255,6 +305,9 @@ function build_jump_model_eq(step::SubP2StepModel.StepData; include_simple_ineq:
     return model, x
 end
 
+# 可先跳过：单步离线求解入口。
+# 它会现建模型、转成 MathOptNLPModel，然后直接调 madnlp(...)。
+# 当前正式 batch 主线不走这条。
 function solve_step_data(step::SubP2StepModel.StepData; print_level = MadNLP.ERROR, include_simple_ineq = true, max_iter = 200, acceptable_tol = 1e-4, acceptable_iter = 5, tol = 1e-8)
     t_build0 = time_ns()
     model, x = build_jump_model_eq(step; include_simple_ineq = include_simple_ineq)
@@ -298,6 +351,8 @@ function solve_step_data(step::SubP2StepModel.StepData; print_level = MadNLP.ERR
     return out
 end
 
+# 可先跳过：文件路径包装层。
+# 只是把 JSON 快照读成 StepData，再转给 solve_step_data(...)。
 function solve_step(path::String; print_level = MadNLP.ERROR, include_simple_ineq = true, max_iter = 200, acceptable_tol = 1e-4, acceptable_iter = 5, tol = 1e-8)
     step = load_step_data(path)
     return solve_step_data(
@@ -311,6 +366,8 @@ function solve_step(path::String; print_level = MadNLP.ERROR, include_simple_ine
     )
 end
 
+# 可先跳过：CLI 入口。
+# 给命令行离线调试单步 snapshot 用，当前 persistent batch 主线不走这里。
 function main()
     if length(ARGS) < 1
         error("usage: julia julia_subp2/solve_step_madnlp_jump_native_eq.jl <snapshot.json> [out.json] [--eq-only] [--max-iter=N] [--acceptable-tol=X] [--acceptable-iter=N] [--tol=X]")
@@ -351,6 +408,7 @@ function main()
     end
 end
 
+# 这个文件既能被 include 给 batch 主线复用，也能单独当 CLI 执行。
 if abspath(PROGRAM_FILE) == @__FILE__
     main()
 end

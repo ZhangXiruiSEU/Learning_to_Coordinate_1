@@ -12,12 +12,41 @@ import jax.numpy as jnp
 import numpy as np
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import JustWorkingOnIt as JAX_Planner
 import verify_jax_vs_original
+
+# -----------------------------------------------------------------------------
+# 这个文件不是 Julia 求解器本体，而是当前稳定 persistent Julia 路线的 Python 侧总控。
+#
+# 它主要做四件事：
+# 1. 启动一个常驻 Julia worker 进程
+# 2. 把 JustWorkingOnIt.py 里的 jax_ADMM_SubP2 临时替换成 Julia IPC 版本
+# 3. 在 Python 侧完成 SubP2 batch payload 的打包与结果解包
+# 4. 跑 fullflow verify / benchmark，并汇总桥接和求解时间
+#
+# 如果你现在只关心"当前正式主线"，最小阅读顺序建议是：
+# 1. JuliaBatchWorker
+# 2. build_batch_export_runtime(...)
+# 3. install_julia_subp2_patch(...)
+# 4. run_once(...)
+# 5. main()
+#
+# 当前主线里可先跳过的部分：
+# - build_step_export(...)
+#   更老的"单步完整快照"导出 helper，这个 runner 当前不直接用
+# - build_step_export_runtime(...)
+#   单步 runtime 导出 helper，当前也不走
+# - JuliaBatchWorker.prepare_batch_payload(...)
+#   留给 prepare_batch 预热/实验接口，当前正式 benchmark 不调用
+# - args.keep_json 分支
+#   这是把 payload 先落盘再交给 Julia 的兼容模式，当前稳定主线默认不走
+# - result_format 的 legacy fallback 分支
+#   当前 worker 默认走紧凑 stacked 回包格式，fallback 主要是兼容旧返回格式
+# -----------------------------------------------------------------------------
 
 JULIA_WORKER = ROOT / "julia_subp2" / "worker_batch_madnlp_jump_native.jl"
 JULIA_STACKED_RESULT_FORMAT = "stacked_runtime_result_v1"
@@ -55,6 +84,7 @@ JULIA_RUNTIME_PARAM_KEYS = (
 )
 
 
+# 当前 runner 的 CLI 入口参数。大部分都是 Julia worker 配置和 benchmark 选项。
 def build_parser():
     p = argparse.ArgumentParser(description="Run fullflow verify with persistent Julia MadNLP SubP2 worker.")
     p.add_argument("--task-idx", type=int, default=0)
@@ -75,6 +105,7 @@ def build_parser():
     return p
 
 
+# 把 numpy / jax 数组、标量等统一转换成 JSON 可序列化对象。
 def _to_jsonable(obj):
     if isinstance(obj, dict):
         return {k: _to_jsonable(v) for k, v in obj.items()}
@@ -89,10 +120,14 @@ def _to_jsonable(obj):
     return obj
 
 
+# 把 Julia 回包里的指标数组安全转成 numpy，并把 null 统一映射成 NaN。
 def _json_metric_array(values):
     return np.asarray([np.nan if v is None else float(v) for v in values], dtype=float)
 
 
+# 可先跳过：单步完整 snapshot 导出 helper。
+# 它会把 init/original 两套参考值都带上，适合离线单步核对；
+# 当前 persistent Julia fullflow runner 并不直接调用它。
 def build_step_export(planner, dims, x_init, x_orig, params_t, meta):
     eq_init = np.array(planner.ipoptax_equality(x_init, params_t, dims), dtype=float)
     ineq_init = np.array(planner.ipoptax_inequality(x_init, params_t, dims), dtype=float)
@@ -120,6 +155,8 @@ def build_step_export(planner, dims, x_init, x_orig, params_t, meta):
     return _to_jsonable(export)
 
 
+# 可先跳过：单步 runtime 导出 helper。
+# 相比上面的完整 snapshot 更轻，但当前这个 batch runner 也不直接走它。
 def build_step_export_runtime(dims, x_init, params_t, meta):
     export = {
         "meta": meta,
@@ -132,6 +169,8 @@ def build_step_export_runtime(dims, x_init, params_t, meta):
     return _to_jsonable(export)
 
 
+# 当前稳定主线直接会走这里。
+# 作用：把 planner 侧的 batch 决策变量和运行期参数裁剪、搬到 host，再打成 Julia worker 能直接消费的紧凑 payload。
 def build_batch_export_runtime(dims, w_init_batch, params_batch, meta):
     filtered_params = {k: params_batch[k] for k in JULIA_RUNTIME_PARAM_KEYS}
     host_payload = jax.device_get(
@@ -153,7 +192,13 @@ def build_batch_export_runtime(dims, w_init_batch, params_batch, meta):
     return _to_jsonable(export)
 
 
+# Python 侧对常驻 Julia worker 的薄封装。
+# 它本身不做求解，只负责：启动进程、发 JSON 请求、收 JSON 回包、关闭进程。
 class JuliaBatchWorker:
+    # 当前稳定主线必经入口：
+    # - 配好 Julia 线程数 / BLAS / solver / 调度策略
+    # - 启动 worker_batch_madnlp_jump_native.jl
+    # - 通过 ping 确认 worker 真的起来了
     def __init__(
         self,
         julia_threads: int = 0,
@@ -192,6 +237,9 @@ class JuliaBatchWorker:
         self.callback = str(ping.get("result", {}).get("callback", callback))
         self.thread_schedule = str(ping.get("result", {}).get("thread_schedule", thread_schedule))
 
+    # 核心阻塞式 IPC。
+    # Python 往 stdin 写一行 JSON，然后同步等待 Julia 从 stdout 回一行 JSON。
+    # 当前主线就是这条 request/response 通道，不是 socket，也不是共享内存。
     def _request(self, payload):
         assert self.proc.stdin is not None
         assert self.proc.stdout is not None
@@ -211,6 +259,9 @@ class JuliaBatchWorker:
             raise RuntimeError(f"Julia worker error: {resp}")
         return resp
 
+    # 可先跳过：文件路径模式。
+    # 只有 keep_json=True 时才会先把 payload 写到磁盘，再让 Julia 读文件。
+    # 当前稳定主线默认不走这条。
     def solve_batch(self, in_path, args):
         return self._request(
             {
@@ -225,6 +276,8 @@ class JuliaBatchWorker:
             }
         )["result"]
 
+    # 可先跳过：prepare_batch 预热/诊断接口。
+    # 当前正式 benchmark 主线没有调用它，保留它主要是给实验和潜在预构建路径用。
     def prepare_batch_payload(self, payload, args):
         return self._request(
             {
@@ -237,6 +290,8 @@ class JuliaBatchWorker:
             }
         )["result"]
 
+    # 当前稳定主线直接走这里。
+    # Python 直接把内存里的 batch payload 发给 Julia worker，不落盘。
     def solve_batch_payload(self, payload, args):
         return self._request(
             {
@@ -251,6 +306,7 @@ class JuliaBatchWorker:
             }
         )["result"]
 
+    # 关闭常驻 Julia worker。正常情况先发 shutdown，再 terminate/kill 兜底。
     def close(self):
         if self.proc.poll() is not None:
             return
@@ -268,7 +324,13 @@ class JuliaBatchWorker:
                 pass
 
 
+# 当前稳定主线的关键接缝。
+# 它会把 JustWorkingOnIt.py 里的 jax_ADMM_SubP2 方法临时替换成 Julia IPC 版本，
+# 从而不改 planner 主循环调用点，就把 SubP2 切到 Julia。
 def install_julia_subp2_patch(args, worker):
+    # 被 monkey-patch 进去的替代版 SubP2。
+    # 当前稳定路径就是：
+    # planner._prepare_subp2_batch -> build_batch_export_runtime -> worker.solve_batch_payload -> planner._unpack_subp2_results
     def patched_jax_admm_subp2(self, Para2_dict):
         planner = self
         N = self.N
@@ -312,6 +374,8 @@ def install_julia_subp2_patch(args, worker):
         prep_out = {"prepare_ms": 0.0, "built": 0.0, "mode": "skipped"}
 
         t_request = time.perf_counter()
+        # 可先跳过：keep_json 兼容模式。
+        # 当前正式主线默认直接走内存 payload，不会先把 JSON 落盘。
         if args.keep_json:
             in_path = ROOT / "julia_subp2" / "tmp_batch_persistent.json"
             with open(in_path, "w", encoding="utf-8") as f:
@@ -323,6 +387,7 @@ def install_julia_subp2_patch(args, worker):
 
         t_rebuild = time.perf_counter()
         mode_codes = np.ones((N + 1,), dtype=int)
+        # 当前主线默认会走这个紧凑 stacked 回包格式。
         if batch_out.get("result_format") == JULIA_STACKED_RESULT_FORMAT:
             x_sol_batch = np.asarray(batch_out["x_sol_batch"], dtype=float)
             if x_sol_batch.ndim == 1:
@@ -332,6 +397,8 @@ def install_julia_subp2_patch(args, worker):
             diag_eq = _json_metric_array(batch_out["eq_inf_batch"])
             diag_ineq = _json_metric_array(batch_out["ineq_vio_batch"])
         else:
+            # 可先跳过：旧结果格式 fallback。
+            # 只有 worker 没返回 stacked_runtime_result_v1 时才会走这里。
             w_opt = []
             diag_iters = []
             diag_eq = []
@@ -386,6 +453,8 @@ def install_julia_subp2_patch(args, worker):
     JAX_Planner.MPC_Planner.jax_ADMM_SubP2 = patched_jax_admm_subp2
 
 
+# 单次 fullflow benchmark/verify。
+# 它会先装上 Julia patch，再调用 verify_jax_vs_original 跑完整 planner，最后把 SubP2 与 bridge 指标汇总出来。
 def run_once(args, worker):
     install_julia_subp2_patch(args, worker)
     t0 = time.perf_counter()
@@ -425,6 +494,8 @@ def run_once(args, worker):
     }
 
 
+# CLI 主入口。
+# 当前你从命令行跑 persistent Julia fullflow 时，实际就是从这里启动。
 def main():
     args = build_parser().parse_args()
     worker = JuliaBatchWorker(
@@ -464,5 +535,6 @@ def main():
         worker.close()
 
 
+# 作为脚本直接执行时，从 main() 进入。
 if __name__ == "__main__":
     main()

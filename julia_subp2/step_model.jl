@@ -4,6 +4,35 @@ using JSON3
 using LinearAlgebra
 using ExaModels
 
+# -----------------------------------------------------------------------------
+# 这个文件是 SubP2 的"底层数学定义层"。
+#
+# 它和上层文件的关系是：
+# - solve_batch_madnlp_jump_native.jl 会直接复用这里的一批 helper、残差函数和 StepData
+# - solve_step_madnlp_jump_native_eq.jl 也会复用这里的数据结构与数学定义
+# - 只有 ExaModels 相关那部分，属于更老的/兼容的建模路径，当前 persistent Julia 主线不直接走
+#
+# 如果你现在只关心"当前正式 batch 主线"，最小阅读顺序建议是：
+# 1. StepData                         # 单步数据长什么样
+# 2. step_data_from_json(...)         # Python/JSON snapshot 如何落成 Julia step
+# 3. pair_term_indexed / gio_terms_indexed / thrust_terms_indexed
+# 4. objective(...)
+# 5. equality_residual(...)
+# 6. inequality_residual(...)
+#
+# 当前主线里可先跳过的部分：
+# - pair_term_from_x / gio_terms_from_x / thrust_terms_from_x
+#   主要给 ExaModels/按 accessor 取值的旧路径用
+# - control_bound_from_x(...)
+#   小型 helper，当前主线没直接走到
+# - add_native_equality_constraints!(...)
+# - add_native_inequality_constraints!(...)
+# - build_examodel(...)
+#   这三块属于 ExaModels 建模路径，当前 persistent Julia + JuMP/MadNLP 主线不直接调用
+# - inequality_resual_component(...)
+#   兼容旧拼写的别名，不是新的核心入口
+# -----------------------------------------------------------------------------
+
 export StepData,
     as_vec,
     as_mat,
@@ -26,6 +55,8 @@ export StepData,
     step_data_from_json,
     build_examodel
 
+# 单个 SubP2 step 的完整静态快照。
+# 当前 batch 主线里，每个 time step 最终都会先被整理成这个结构。
 struct StepData
     meta
     dims::NTuple{6, Int}
@@ -40,10 +71,13 @@ struct StepData
     orig_ineq_ref::Vector{Float64}
 end
 
+# 把 JSON 数组等通用容器稳定转换成 Vector{Float64}。
+# 当前主线会频繁走这里，属于基础清洗 helper。
 function as_vec(x)
     return [Float64(v) for v in x]
 end
 
+# 把嵌套数组转换成 Matrix{Float64}，并显式检查每行列数一致。
 function as_mat(x)
     rows = length(x)
     cols = length(x[1])
@@ -57,6 +91,8 @@ function as_mat(x)
     return out
 end
 
+# 按行展平矩阵。当前 persistent batch 主线基本不依赖它，
+# 更偏工具/兼容 helper，可先跳过。
 function rowmajor_vec(mat)
     out = Any[]
     sizehint!(out, length(mat))
@@ -68,6 +104,8 @@ function rowmajor_vec(mat)
     return out
 end
 
+# 四元数 -> 旋转矩阵。
+# equality/inequality residual 和若干单步建模函数都会复用。
 function q_to_rotation(q)
     q0, q1, q2, q3 = q
     return [
@@ -77,6 +115,8 @@ function q_to_rotation(q)
     ]
 end
 
+# 把打平后的决策变量 w 拆成 xl / ul / xc / uc 四块。
+# 当前 residual/objective 路径会直接依赖这个函数。
 function unpack_w(w, dims)
     nxl, nul, nxi, nui, nq, _ = dims
     xl = Any[w[i] for i in 1:nxl]
@@ -96,6 +136,8 @@ function unpack_w(w, dims)
     return xl, ul, xc, uc
 end
 
+# 下面这组 accessor 主要给"按索引直接拼表达式"的底层 helper 用。
+# 其中 indexed 版本在当前 batch 主线会间接用到；from_x 版本主要服务 ExaModels 路径。
 @inline x_xl(w, idx) = w[idx]
 @inline x_ul(w, nxl, idx) = w[nxl + idx]
 @inline x_xi(w, dims, i, j) = begin
@@ -109,6 +151,8 @@ end
     w[base + nxi + j]
 end
 
+# 从打平变量向量里直接取负载四元数并展开旋转矩阵。
+# 主要给 ExaModels 约束构造路径用，当前 batch 主线不直接走这里。
 function q_to_rotation_from_x(w, dims)
     q0 = x_xl(w, 7)
     q1 = x_xl(w, 8)
@@ -121,6 +165,7 @@ function q_to_rotation_from_x(w, dims)
     ]
 end
 
+# 手写 3D 叉乘，避免在符号/建模表达式里频繁构小向量。
 function cross3(ax, ay, az, bx, by, bz)
     return (
         ay * bz - az * by,
@@ -129,6 +174,10 @@ function cross3(ax, ay, az, bx, by, bz)
     )
 end
 
+# 旧的 from_x 版本推力项 helper：
+# - 主要服务 ExaModels / accessor 风格约束构造
+# - 当前 persistent batch 主线更直接用下面的 thrust_terms_indexed(...)
+# 所以这里属于"可先跳过，但不是废代码"。
 Base.@noinline function thrust_terms_from_x(w, dims, Rl, wl, awl, ra1, ra2, ra3, cl0, mq, ml, g, ul1, ul2, ul3, i)
     d1 = x_xi(w, dims, i, 1)
     d2 = x_xi(w, dims, i, 2)
@@ -166,6 +215,7 @@ Base.@noinline function thrust_terms_from_x(w, dims, Rl, wl, awl, ra1, ra2, ra3,
     return f1, f2, f3
 end
 
+# 旧的 from_x 版本绳索-绳索间距项 helper，主要给 ExaModels 路径用。
 Base.@noinline function pair_term_from_x(w, dims, Rl, ra_i1, ra_i2, ra_i3, ra_j1, ra_j2, ra_j3, cl0, rq, eps_margin, kc, num_dis, i, j)
     frac = kc / num_dis
     pib_i1 = ra_i1 + frac * cl0 * (Rl[1, 1] * x_xi(w, dims, i, 1) + Rl[2, 1] * x_xi(w, dims, i, 2) + Rl[3, 1] * x_xi(w, dims, i, 3))
@@ -175,6 +225,7 @@ Base.@noinline function pair_term_from_x(w, dims, Rl, ra_i1, ra_i2, ra_i3, ra_j1
     return ((kc / num_dis) * 4.0 * rq)^2 + eps_margin - ((pib_i1 - pib_j1)^2 + (pib_i2 - pib_j2)^2)
 end
 
+# 旧的 from_x 版本几何约束 helper，主要给 ExaModels 路径用。
 Base.@noinline function gio_terms_from_x(w, dims, Rl, ra1, ra2, ra3, cl0, rl, num_dis, i)
     frac = num_dis / num_dis
     ra_norm = sqrt(ra1^2 + ra2^2 + ra3^2) + 1e-9
@@ -184,10 +235,14 @@ Base.@noinline function gio_terms_from_x(w, dims, Rl, ra1, ra2, ra3, cl0, rl, nu
     return ei_pib - (rl + cl0), -rl - ei_pib
 end
 
+# 控制量上下界的小 helper。当前 persistent batch 主线没有直接用到，
+# 保留它主要是为了旧路径/局部表达式复用。
 @inline function control_bound_from_x(w, dims, active_u, ui_bound, i, j, sign)
     return active_u * (sign * x_ui(w, dims, i, j) - ui_bound)
 end
 
+# 当前 batch 主线会直接复用的 indexed helper：
+# 给 JuMP 参数化模型构造绳索-绳索间距约束项。
 Base.@noinline function pair_term_indexed(x, base, stride, Rl, ra_i1, ra_i2, ra_i3, ra_j1, ra_j2, ra_j3, cl0, rq, eps_margin, kc, num_dis, i, j)
     frac = kc / num_dis
     ioff = base + (i - 1) * stride
@@ -199,6 +254,8 @@ Base.@noinline function pair_term_indexed(x, base, stride, Rl, ra_i1, ra_i2, ra_
     return ((kc / num_dis) * 4.0 * rq)^2 + eps_margin - ((pib_i1 - pib_j1)^2 + (pib_i2 - pib_j2)^2)
 end
 
+# 当前 batch 主线会直接复用的 indexed helper：
+# 给 JuMP 参数化模型构造几何上下界项。
 Base.@noinline function gio_terms_indexed(x, base, stride, Rl, ra1, ra2, ra3, cl0, rl, i)
     ioff = base + (i - 1) * stride
     ra_norm = sqrt(ra1^2 + ra2^2 + ra3^2) + 1e-9
@@ -208,6 +265,8 @@ Base.@noinline function gio_terms_indexed(x, base, stride, Rl, ra1, ra2, ra3, cl
     return ei_pib - (rl + cl0), -rl - ei_pib
 end
 
+# 当前 batch 主线会直接复用的 indexed helper：
+# 给 JuMP 参数化模型构造每架无人机的推力约束项。
 Base.@noinline function thrust_terms_indexed(x, base, stride, Rl, wl, awl, ra1, ra2, ra3, cl0, mq, ml, g, ul1, ul2, ul3, i)
     off = base + (i - 1) * stride
     d1 = x[off + 1]
@@ -245,6 +304,8 @@ Base.@noinline function thrust_terms_indexed(x, base, stride, Rl, wl, awl, ra1, 
     return f1, f2, f3
 end
 
+# 当前主线会直接依赖的目标函数定义。
+# Python 侧也会用同一数学形式做对照/快照导出。
 function objective(w, params, dims)
     xl, ul, xc, uc = unpack_w(w, dims)
     active_u = 1.0 - Float64(params["is_terminal"])
@@ -274,6 +335,8 @@ function objective(w, params, dims)
     return cost
 end
 
+# 当前主线会直接依赖的等式残差定义。
+# 用来做单步诊断、benchmark 统计和解质量核对。
 function equality_residual(w, params, dims)
     xl, ul, xc, _ = unpack_w(w, dims)
     active_u = 1.0 - Float64(params["is_terminal"])
@@ -298,10 +361,13 @@ function equality_residual(w, params, dims)
     return out
 end
 
+# 单独取某一维等式残差。更偏诊断/兼容接口，当前主线一般不单独调它。
 function equality_component(w, params, dims, idx)
     return equality_residual(w, params, dims)[idx]
 end
 
+# 当前主线会直接依赖的不等式残差定义。
+# 这里把避障、张力、控制边界、推力边界等全部按统一顺序展开。
 function inequality_residual(w, params, dims)
     xl, ul, xc, uc = unpack_w(w, dims)
     _, _, _, nui, nq, num_dis = dims
@@ -432,14 +498,19 @@ function inequality_residual(w, params, dims)
     return ineq
 end
 
+# 单独取某一维不等式残差。主要给诊断/兼容接口用。
 function inequality_component(w, params, dims, idx)
     return inequality_residual(w, params, dims)[idx]
 end
 
+# 兼容旧拼写的别名接口。
+# 名字里 residual 拼成了 resual，当前不建议再把它当新入口使用。
 function inequality_resual_component(w, params, dims, idx)
     return inequality_component(w, params, dims, idx)
 end
 
+# 可先跳过：ExaModels 路径下的等式约束构造。
+# 当前 persistent Julia 主线走 JuMP/MadNLP 参数化模型，不直接走这里。
 function add_native_equality_constraints!(core, x, step::StepData)
     params = step.params
     dims = step.dims
@@ -501,6 +572,8 @@ function add_native_equality_constraints!(core, x, step::StepData)
     end
 end
 
+# 可先跳过：ExaModels 路径下的不等式约束构造。
+# 保留它主要是为了旧实验/兼容 ExaModels，不是当前主线热路径。
 function add_native_inequality_constraints!(core, x, step::StepData; include_thrust::Bool = true)
     params = step.params
     dims = step.dims
@@ -664,6 +737,8 @@ function add_native_inequality_constraints!(core, x, step::StepData; include_thr
     end
 end
 
+# 当前 batch 主线必经的数据入口之一。
+# Python 发来的 step snapshot / stacked JSON 最终都会被整理成 StepData。
 function step_data_from_json(data)
     dims = Tuple(Int.(data["step"]["dims"]))
     step = data["step"]
@@ -689,11 +764,14 @@ function step_data_from_json(data)
     )
 end
 
+# 文件路径包装层，主要给单步离线调试用。当前 persistent worker 主线更常直接走内存 payload。
 function load_step_data(path::String)
     data = JSON3.read(read(path, String))
     return step_data_from_json(data)
 end
 
+# 可先跳过：ExaModels 建模入口。
+# 它不是当前 persistent Julia + JuMP/MadNLP 主线的一部分，保留原因主要是历史实验和兼容验证。
 function build_examodel(step::StepData; include_ineq::Bool = true, include_thrust::Bool = true)
     core = ExaCore()
     x = variable(core, length(step.x_init); start = step.x_init)

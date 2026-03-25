@@ -26,25 +26,29 @@ def _get_psd_eigenvalue_shift_ub(Q):
 @jit
 def _get_acceptable_psd_eigenvalue_shift(Q, k, delta):
     n, _ = Q.shape
+    dtype = Q.dtype
+    zero = np.array(0.0, dtype=dtype)
+    half = np.array(0.5, dtype=dtype)
+    two = np.array(2.0, dtype=dtype)
 
     already_psd = is_positive_definite(Q, delta=delta)
 
     def continuation_criterion(k):
         return np.logical_and(
             np.logical_not(already_psd),
-            is_positive_definite(Q + k * np.eye(n), delta=delta),
+            is_positive_definite(Q + k * np.eye(n, dtype=dtype), delta=delta),
         )
 
     def body(k):
-        return 0.5 * k
+        return half * k
 
-    k = 2.0 * lax.while_loop(
+    k = two * lax.while_loop(
         continuation_criterion,
         body,
         k,
     )
 
-    return lax.select(already_psd, 0.0, k)
+    return lax.select(already_psd, zero, k)
 
 
 @partial(jit, static_argnames=("use_lapack", "iterate"))
@@ -65,13 +69,14 @@ def project_psd_cone(Q, *, delta=0.0, use_lapack=True, iterate=True):
         return 0.5 * (Q_plus + Q_plus.T)
 
     n = Q.shape[0]
+    eye = np.eye(n, dtype=Q.dtype)
 
     k = _get_psd_eigenvalue_shift_ub(Q)
 
     if iterate:
         k = _get_acceptable_psd_eigenvalue_shift(Q, k, delta)
 
-    return Q + k * np.eye(n)
+    return Q + k * eye
 
 
 @jit

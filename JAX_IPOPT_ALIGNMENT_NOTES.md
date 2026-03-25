@@ -131,7 +131,7 @@ benchmark noticeably under background load.
 Formal benchmark command for the stable `~0.94s` branch:
 
 ```bash
-MPLBACKEND=Agg MPLCONFIGDIR=/tmp/mpl VERIFY_TASK_IDX=0 VERIFY_HORIZON=100 VERIFY_ADMM_ITERS=3 JAX_PLATFORMS=cpu /home/mpc/miniconda3/envs/xirui/bin/python -u python_archive/run_julia_subp2_fullflow_persistent.py --task-idx 0 --repeats 2 --julia-threads 20 --julia-blas-threads 1 --julia-linear-solver mumps --julia-kkt-system default --julia-callback default --julia-thread-schedule static
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/mpl VERIFY_TASK_IDX=0 VERIFY_HORIZON=100 VERIFY_ADMM_ITERS=3 JAX_PLATFORMS=cpu /home/mpc/miniconda3/envs/xirui/bin/python -u run_julia_subp2_fullflow_persistent.py --task-idx 0 --repeats 2 --julia-threads 20 --julia-blas-threads 1 --julia-linear-solver mumps --julia-kkt-system default --julia-callback default --julia-thread-schedule static
 ```
 
 Anything that changes the `SubP2` backend, enables JAX barrier/SQP, or switches
@@ -2234,7 +2234,7 @@ So:
 
 Files:
 
-- [python_archive/run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/python_archive/run_julia_subp2_fullflow_persistent.py)
+- [run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/run_julia_subp2_fullflow_persistent.py)
 - [julia_subp2/worker_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/worker_batch_madnlp_jump_native.jl)
 
 This version keeps one Julia process alive across repeated fullflow runs and
@@ -2294,7 +2294,7 @@ Files:
 
 - [julia_subp2/solve_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/solve_batch_madnlp_jump_native.jl)
 - [julia_subp2/worker_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/worker_batch_madnlp_jump_native.jl)
-- [python_archive/run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/python_archive/run_julia_subp2_fullflow_persistent.py)
+- [run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/run_julia_subp2_fullflow_persistent.py)
 
 The next optimization step was to cache not only the Julia worker process, but
 also each exact `step` model inside that worker:
@@ -2377,7 +2377,7 @@ Important files:
 
 - [julia_subp2/solve_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/solve_batch_madnlp_jump_native.jl)
 - [julia_subp2/worker_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/worker_batch_madnlp_jump_native.jl)
-- [python_archive/run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/python_archive/run_julia_subp2_fullflow_persistent.py)
+- [run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/run_julia_subp2_fullflow_persistent.py)
 
 Current implementation status:
 
@@ -2438,7 +2438,7 @@ CPU threads. The runner and bridge benchmark were updated so that:
 
 Relevant files:
 
-- [python_archive/run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/python_archive/run_julia_subp2_fullflow_persistent.py)
+- [run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/run_julia_subp2_fullflow_persistent.py)
 - [python_archive/benchmark_julia_worker_bridge.py](/home/mpc/xirui/meta-learn_useThis/python_archive/benchmark_julia_worker_bridge.py)
 - [julia_subp2/worker_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/worker_batch_madnlp_jump_native.jl)
 
@@ -2481,7 +2481,7 @@ therefore updated to force:
 Relevant files:
 
 - [julia_subp2/worker_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/worker_batch_madnlp_jump_native.jl)
-- [python_archive/run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/python_archive/run_julia_subp2_fullflow_persistent.py)
+- [run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/run_julia_subp2_fullflow_persistent.py)
 
 Formal-scale benchmark (`task=0, horizon=100, admm=3`, repeat-2 warm run):
 
@@ -2566,7 +2566,7 @@ Important files:
 
 - [julia_subp2/solve_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/solve_batch_madnlp_jump_native.jl)
 - [julia_subp2/worker_batch_madnlp_jump_native.jl](/home/mpc/xirui/meta-learn_useThis/julia_subp2/worker_batch_madnlp_jump_native.jl)
-- [python_archive/run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/python_archive/run_julia_subp2_fullflow_persistent.py)
+- [run_julia_subp2_fullflow_persistent.py](/home/mpc/xirui/meta-learn_useThis/run_julia_subp2_fullflow_persistent.py)
 
 This is still not full symbolic parameter reuse in the strict JuMP sense, but it
 is already much closer to a true "build once / solve many" execution model than

@@ -20,7 +20,7 @@
   当前 JAX planner 主实现。
 - `verify_jax_vs_original.py`
   对比原版 CasADi 路线和当前 JAX 路线的数值结果。
-- `python_archive/run_julia_subp2_fullflow_persistent.py`
+- `run_julia_subp2_fullflow_persistent.py`
   当前最重要的正式 benchmark 入口。它会跑 original，并跑 `JAX + persistent Julia SubP2`，最后给出时间和误差。
 - `julia_subp2/worker_batch_madnlp_jump_native.jl`
   常驻 Julia worker，走 stdin/stdout JSON 协议。
@@ -73,7 +73,7 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/mpl \
 VERIFY_TASK_IDX=0 VERIFY_HORIZON=100 VERIFY_ADMM_ITERS=3 \
 JAX_PLATFORMS=cpu \
 /home/mpc/miniconda3/envs/xirui/bin/python -u \
-python_archive/run_julia_subp2_fullflow_persistent.py \
+run_julia_subp2_fullflow_persistent.py \
   --task-idx 0 \
   --repeats 2 \
   --julia-threads 20 \
@@ -137,7 +137,7 @@ VERIFY_JAX_BACKEND_SELECTED=1 JAX_PLATFORMS=cpu \
 
 主链路如下：
 
-1. Python 外层在 [`python_archive/run_julia_subp2_fullflow_persistent.py`](python_archive/run_julia_subp2_fullflow_persistent.py) 里启动 `JuliaBatchWorker`。
+1. Python 外层在 [`run_julia_subp2_fullflow_persistent.py`](run_julia_subp2_fullflow_persistent.py) 里启动 `JuliaBatchWorker`。
 2. Python 把当前 ADMM 轮所有 step 的 `SubP2` 初值和运行时参数打成一个 batch payload。
 3. Python 只发送 Julia 真正会用到的字段，不再把无关数据一起打包。
 4. Julia worker 在 [`julia_subp2/worker_batch_madnlp_jump_native.jl`](julia_subp2/worker_batch_madnlp_jump_native.jl) 里接收 JSON 命令。

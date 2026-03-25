@@ -30,28 +30,51 @@ Reference
 
 """
 
-_GLOBAL_SUBP2_BARRIER_RUNTIME_COMMON_CACHE = {}
-_GLOBAL_SUBP2_BARRIER_RUNTIME_STAGE_CACHE = {}
-_GLOBAL_LOAD_DERIVS_JIT = None
-_GLOBAL_CABLE_DERIVS_JIT = None
+# -----------------------------------------------------------------------------
+# 这个文件包含三层东西，文件的布局也对应这个顺序：
+# 1. 当前稳定主线会直接走到的 Python/JAX 逻辑，在 1288 行之前
+#    - JAX SubP1
+#    - SubP2 batch 打包/解包
+#    - JAX SubP3
+#    - 以及给 persistent Julia SubP2 做诊断时复用的 objective/residual 定义
+# 2. 纯 JAX SubP2 实验分支
+#    - ipoptax 直接求解
+#    - SQP / barrier 试验
+# 3. 更老的 CasADi/梯度求解与训练代码
+#
+# 当前正式稳定主线是：
+# Python/JAX SubP1 + Python 侧 batch 打包 + 常驻 Julia worker 解 SubP2 + JAX SubP3。
+# 这条主线由 run_julia_subp2_fullflow_persistent.py 在外部拼起来，
+# 并且会在运行时把 self.jax_ADMM_SubP2 替换成 Julia IPC 版本。
+#
+
+# 读懂当前正式主线的顺序建议：
+# 1. MPC_Planner.__init__
+# 2. _solve_load_subp1_forward_only / _solve_cable_subp1_forward_only
+# 3. _initialize_trajectories / _get_static_params
+# 4. _pack_para2
+# 5. _prepare_subp2_batch / _unpack_subp2_results
+# 6. jax_ADMM_forward_MPC
+# 7. jax_ADMM_SubP3
+# 8. ipoptax_objective / ipoptax_equality / ipoptax_inequality
+#    这三个在当前稳定 Julia 路线里主要用于快照导出和结果核对，不是实际 SubP2 求解器
+# _pack_paraL / _pack_paraC 仅旧 packaged SubP1 路径使用
+
+# 下面三个词在这个文件里经常出现，也不是当前 persistent Julia 主线的默认路径：
+# - packaged: 旧 SubP1 包装接口。
+#   指把当前轮输入重新压成 ParaL/ParaC 这种 legacy 长向量，再交给兼容包装器拆包求解。
+# - derivs: 轨迹求完以后额外导出的导数包。
+#   典型内容是 Fx/Fu/Qxu/Quu_inv/K_FB，只在旧接口兼容、导数对齐或诊断时需要。
+# - legacy: 更老的原版 CasADi/DDP/训练实现。
+#   这些代码保留是为了历史对照和兼容。
+# -----------------------------------------------------------------------------
+
+# 以下仍然留在文件前部的是"当前稳定主线"会在 __init__ 里直接绑定的全局 JIT 缓存。
+# 也就是 SubP1 forward-only / 初始化轨迹这条主线真正会默认走到的部分。
 _GLOBAL_LOAD_SOLVER_JIT = None
 _GLOBAL_CABLE_SOLVER_JIT = None
 _GLOBAL_INIT_LOAD_TRAJ_JIT = None
 _GLOBAL_INIT_CABLE_TRAJ_JIT = None
-
-
-def _get_global_load_derivs_jit():
-    global _GLOBAL_LOAD_DERIVS_JIT
-    if _GLOBAL_LOAD_DERIVS_JIT is None:
-        _GLOBAL_LOAD_DERIVS_JIT = jax.jit(MPC_Planner._static_load_derivs)
-    return _GLOBAL_LOAD_DERIVS_JIT
-
-
-def _get_global_cable_derivs_jit():
-    global _GLOBAL_CABLE_DERIVS_JIT
-    if _GLOBAL_CABLE_DERIVS_JIT is None:
-        _GLOBAL_CABLE_DERIVS_JIT = jax.jit(MPC_Planner._static_cable_derivs)
-    return _GLOBAL_CABLE_DERIVS_JIT
 
 
 def _get_global_load_solver_jit():
@@ -104,320 +127,12 @@ def _get_global_init_cable_traj_jit():
     return _GLOBAL_INIT_CABLE_TRAJ_JIT
 
 
-def _subp2_filter_accept_batch(init_metrics, cand_metrics, filter_gamma_theta, filter_gamma_phi, accept_abs, accept_ratio):
-    theta_ok = cand_metrics["theta"] <= (1.0 - filter_gamma_theta) * init_metrics["theta"]
-    barr_ok = cand_metrics["barr"] <= init_metrics["barr"] - filter_gamma_phi * init_metrics["theta"]
-    feas_ok = cand_metrics["feas"] <= jnp.maximum(accept_abs, accept_ratio * init_metrics["feas"])
-    return jnp.logical_or(theta_ok, jnp.logical_or(barr_ok, feas_ok))
-
-
-def _subp2_tail_soft_mask(tail, metrics, finite_mask, soft_mu_tol, soft_comp_tol, soft_dual_tol, soft_trace_ineq_tol, soft_eq_tol, soft_raw_ineq_tol):
-    return jnp.logical_and(
-        finite_mask,
-        jnp.logical_and(
-            tail["mu"] <= soft_mu_tol,
-            jnp.logical_and(
-                tail["comp"] <= soft_comp_tol,
-                jnp.logical_and(
-                    tail["dual"] <= soft_dual_tol,
-                    jnp.logical_and(
-                        tail["ineq"] <= soft_trace_ineq_tol,
-                        jnp.logical_and(
-                            metrics["eq_inf"] <= soft_eq_tol,
-                            metrics["ineq_vio"] <= soft_raw_ineq_tol,
-                        ),
-                    ),
-                ),
-            ),
-        ),
-    )
-
-
-@jax.jit
-def _subp2_fast_select_kernel(
-    w_init_batch,
-    main_x,
-    main_conv,
-    main_iters,
-    init_metrics,
-    main_metrics,
-    main_tail,
-    retry1_x,
-    retry1_finite,
-    retry1_conv,
-    retry1_iters,
-    retry1_metrics,
-    retry1_tail,
-    retry2_x,
-    retry2_finite,
-    retry2_conv,
-    retry2_iters,
-    retry2_metrics,
-    retry2_tail,
-    retry_on_nonconv,
-    enable_retry2,
-    retry_trigger_ratio,
-    restoration_theta_ratio,
-    filter_gamma_theta,
-    filter_gamma_phi,
-    accept_abs,
-    accept_ratio,
-    soft_mu_tol,
-    soft_comp_tol,
-    soft_dual_tol,
-    soft_eq_tol,
-    soft_raw_ineq_tol,
-    soft_trace_ineq_tol,
-    mode_code_main,
-    mode_code_main_soft,
-    mode_code_bestfeas,
-    mode_code_fallback,
-    mode_code_retry1,
-    mode_code_retry1_soft,
-    mode_code_retry1_bestfeas,
-    mode_code_retry2,
-    mode_code_retry2_soft,
-    mode_code_retry2_bestfeas,
-):
-    finite_mask = jnp.all(jnp.isfinite(main_x), axis=1)
-    soft_mask = _subp2_tail_soft_mask(
-        main_tail,
-        main_metrics,
-        finite_mask,
-        soft_mu_tol,
-        soft_comp_tol,
-        soft_dual_tol,
-        soft_trace_ineq_tol,
-        soft_eq_tol,
-        soft_raw_ineq_tol,
-    )
-    conv_mask = jnp.logical_and(finite_mask, jnp.logical_or(main_conv, soft_mask))
-    filter_ok = jnp.logical_and(
-        finite_mask,
-        _subp2_filter_accept_batch(
-            init_metrics,
-            main_metrics,
-            filter_gamma_theta,
-            filter_gamma_phi,
-            accept_abs,
-            accept_ratio,
-        ),
-    )
-    resto_ok = jnp.logical_and(
-        finite_mask,
-        main_metrics["theta"] <= restoration_theta_ratio * init_metrics["theta"],
-    )
-    improved = jnp.logical_and(
-        finite_mask,
-        main_metrics["feas"] < (init_metrics["feas"] - 1e-6),
-    )
-    main_bestfeas_mask = jnp.logical_and(
-        jnp.logical_not(conv_mask),
-        jnp.logical_or(filter_ok, jnp.logical_and(improved, resto_ok)),
-    )
-
-    candidate_x = jnp.where(finite_mask[:, None], main_x, w_init_batch)
-    candidate_metrics = {
-        "eq_inf": jnp.where(finite_mask, main_metrics["eq_inf"], init_metrics["eq_inf"]),
-        "ineq_vio": jnp.where(finite_mask, main_metrics["ineq_vio"], init_metrics["ineq_vio"]),
-        "feas": jnp.where(finite_mask, main_metrics["feas"], jnp.inf),
-        "theta": jnp.where(finite_mask, main_metrics["theta"], jnp.inf),
-        "barr": jnp.where(finite_mask, main_metrics["barr"], jnp.inf),
-    }
-    candidate_tail = {
-        "mu": jnp.where(finite_mask, main_tail["mu"], jnp.nan),
-        "ineq": jnp.where(finite_mask, main_tail["ineq"], jnp.nan),
-        "comp": jnp.where(finite_mask, main_tail["comp"], jnp.nan),
-        "dual": jnp.where(finite_mask, main_tail["dual"], jnp.nan),
-    }
-    accepted_conv_mask = conv_mask
-    diag_iters = main_iters
-    diag_mode_codes = jnp.where(
-        main_conv,
-        mode_code_main,
-        jnp.where(
-            soft_mask,
-            mode_code_main_soft,
-            jnp.where(main_bestfeas_mask, mode_code_bestfeas, mode_code_fallback),
-        ),
-    )
-
-    need_retry_mask = jnp.logical_or(
-        jnp.logical_not(finite_mask),
-        jnp.logical_and(
-            jnp.logical_and(retry_on_nonconv, jnp.logical_not(conv_mask)),
-            main_metrics["feas"] >= retry_trigger_ratio * init_metrics["feas"],
-        ),
-    )
-
-    def _apply_candidate_update(
-        success_mask,
-        better_mask,
-        x_new,
-        metrics_new,
-        tail_new,
-        iters_new,
-        mode_success_code,
-        mode_soft_code,
-        mode_better_code,
-        soft_success_mask,
-        conv_success_mask,
-        candidate_x,
-        candidate_metrics,
-        candidate_tail,
-        accepted_conv_mask,
-        diag_iters,
-        diag_mode_codes,
-    ):
-        update_mask = jnp.logical_or(success_mask, better_mask)
-        candidate_x = jnp.where(update_mask[:, None], x_new, candidate_x)
-        candidate_metrics = {
-            "eq_inf": jnp.where(update_mask, metrics_new["eq_inf"], candidate_metrics["eq_inf"]),
-            "ineq_vio": jnp.where(update_mask, metrics_new["ineq_vio"], candidate_metrics["ineq_vio"]),
-            "feas": jnp.where(update_mask, metrics_new["feas"], candidate_metrics["feas"]),
-            "theta": jnp.where(update_mask, metrics_new["theta"], candidate_metrics["theta"]),
-            "barr": jnp.where(update_mask, metrics_new["barr"], candidate_metrics["barr"]),
-        }
-        candidate_tail = {
-            "mu": jnp.where(update_mask, tail_new["mu"], candidate_tail["mu"]),
-            "ineq": jnp.where(update_mask, tail_new["ineq"], candidate_tail["ineq"]),
-            "comp": jnp.where(update_mask, tail_new["comp"], candidate_tail["comp"]),
-            "dual": jnp.where(update_mask, tail_new["dual"], candidate_tail["dual"]),
-        }
-        diag_iters = jnp.where(update_mask, iters_new, diag_iters)
-        diag_mode_codes = jnp.where(
-            success_mask,
-            jnp.where(jnp.logical_and(soft_success_mask, jnp.logical_not(conv_success_mask)), mode_soft_code, mode_success_code),
-            jnp.where(better_mask, mode_better_code, diag_mode_codes),
-        )
-        accepted_conv_mask = jnp.logical_or(accepted_conv_mask, success_mask)
-        return candidate_x, candidate_metrics, candidate_tail, accepted_conv_mask, diag_iters, diag_mode_codes
-
-    retry1_soft = _subp2_tail_soft_mask(
-        retry1_tail,
-        retry1_metrics,
-        retry1_finite,
-        soft_mu_tol,
-        soft_comp_tol,
-        soft_dual_tol,
-        soft_trace_ineq_tol,
-        soft_eq_tol,
-        soft_raw_ineq_tol,
-    )
-    retry1_success = jnp.logical_and(
-        need_retry_mask,
-        jnp.logical_and(retry1_finite, jnp.logical_or(retry1_conv, retry1_soft)),
-    )
-    retry1_better = jnp.logical_and(
-        need_retry_mask,
-        jnp.logical_and(retry1_finite, retry1_metrics["feas"] < candidate_metrics["feas"]),
-    )
-    candidate_x, candidate_metrics, candidate_tail, accepted_conv_mask, diag_iters, diag_mode_codes = _apply_candidate_update(
-        retry1_success,
-        retry1_better,
-        retry1_x,
-        retry1_metrics,
-        retry1_tail,
-        retry1_iters,
-        mode_code_retry1,
-        mode_code_retry1_soft,
-        mode_code_retry1_bestfeas,
-        retry1_soft,
-        retry1_conv,
-        candidate_x,
-        candidate_metrics,
-        candidate_tail,
-        accepted_conv_mask,
-        diag_iters,
-        diag_mode_codes,
-    )
-
-    retry2_needed = jnp.logical_and(enable_retry2, need_retry_mask)
-    retry2_soft = _subp2_tail_soft_mask(
-        retry2_tail,
-        retry2_metrics,
-        retry2_finite,
-        soft_mu_tol,
-        soft_comp_tol,
-        soft_dual_tol,
-        soft_trace_ineq_tol,
-        soft_eq_tol,
-        soft_raw_ineq_tol,
-    )
-    retry2_success = jnp.logical_and(
-        retry2_needed,
-        jnp.logical_and(retry2_finite, jnp.logical_or(retry2_conv, retry2_soft)),
-    )
-    retry2_better = jnp.logical_and(
-        retry2_needed,
-        jnp.logical_and(retry2_finite, retry2_metrics["feas"] < candidate_metrics["feas"]),
-    )
-    candidate_x, candidate_metrics, candidate_tail, accepted_conv_mask, diag_iters, diag_mode_codes = _apply_candidate_update(
-        retry2_success,
-        retry2_better,
-        retry2_x,
-        retry2_metrics,
-        retry2_tail,
-        retry2_iters,
-        mode_code_retry2,
-        mode_code_retry2_soft,
-        mode_code_retry2_bestfeas,
-        retry2_soft,
-        retry2_conv,
-        candidate_x,
-        candidate_metrics,
-        candidate_tail,
-        accepted_conv_mask,
-        diag_iters,
-        diag_mode_codes,
-    )
-
-    candidate_valid = jnp.isfinite(candidate_metrics["feas"])
-    filter_ok_final = jnp.logical_and(
-        candidate_valid,
-        _subp2_filter_accept_batch(
-            init_metrics,
-            candidate_metrics,
-            filter_gamma_theta,
-            filter_gamma_phi,
-            accept_abs,
-            accept_ratio,
-        ),
-    )
-    resto_ok_final = jnp.logical_and(
-        candidate_valid,
-        candidate_metrics["theta"] <= restoration_theta_ratio * init_metrics["theta"],
-    )
-    improved_final = jnp.logical_and(
-        candidate_valid,
-        candidate_metrics["feas"] < (init_metrics["feas"] - 1e-6),
-    )
-    bestfeas_mask = jnp.logical_and(
-        jnp.logical_not(accepted_conv_mask),
-        jnp.logical_or(filter_ok_final, jnp.logical_and(improved_final, resto_ok_final)),
-    )
-    accept_mask = jnp.logical_or(accepted_conv_mask, bestfeas_mask)
-    diag_mode_codes = jnp.where(
-        jnp.logical_and(jnp.logical_not(accept_mask), jnp.logical_not(accepted_conv_mask)),
-        mode_code_fallback,
-        diag_mode_codes,
-    )
-
-    return {
-        "w_opt_batch": jnp.where(accept_mask[:, None], candidate_x, w_init_batch),
-        "accept_mask": accept_mask,
-        "accepted_conv_mask": accepted_conv_mask,
-        "diag_mode_codes": diag_mode_codes,
-        "diag_iters": jnp.where(accept_mask, diag_iters, 0),
-        "diag_eq_inf": jnp.where(accept_mask, candidate_metrics["eq_inf"], init_metrics["eq_inf"]),
-        "diag_ineq_vio": jnp.where(accept_mask, candidate_metrics["ineq_vio"], init_metrics["ineq_vio"]),
-        "diag_tail_mu": jnp.where(candidate_valid, candidate_tail["mu"], jnp.nan),
-        "diag_tail_ineq": jnp.where(candidate_valid, candidate_tail["ineq"], jnp.nan),
-        "diag_tail_comp": jnp.where(candidate_valid, candidate_tail["comp"], jnp.nan),
-        "diag_tail_dual": jnp.where(candidate_valid, candidate_tail["dual"], jnp.nan),
-    }
 
 class MPC_Planner:
+    # 当前稳定主线必经入口：
+    # - 建立系统常量、维度、分配矩阵、JAX jit 缓存
+    # - 为后面的 SubP1 / SubP2 打包 / SubP3 提供公共静态数据
+
     def __init__(self, sysm_para, dt_ctrl, horizon):
         # Payload's parameters
         self.m1     = sysm_para[0] # the payload's mass [kg]
@@ -544,63 +259,6 @@ class MPC_Planner:
         self.Jl_inv = jnp.linalg.inv(jnp.array(self.Jl))# 逆矩阵
 
     @staticmethod
-    def _static_load_derivs(xs, us, params_b):
-        """[JAX 静态算子] 并行提取负载轨迹的 Jacobian 和反馈增益"""
-        def _calc_step(x, u, p):
-            dyn = MPC_Planner.jax_load_dynamics
-            cost = MPC_Planner.jax_load_stage_cost
-            # 计算动力学 Jacobian
-            fx = jax.jacfwd(dyn, 0)(x, u, p)
-            fu = jax.jacfwd(dyn, 1)(x, u, p)
-            # 计算代价函数 Hessian 和 Jacobian (用于反馈增益 K_fb)
-            luu = jax.hessian(cost, 1)(x, u, p)
-            lxu = jax.jacfwd(jax.grad(cost, 0), 1)(x, u, p)
-            # 正则化求逆 (确保数值稳定性)
-            Quu_inv = jnp.linalg.inv(luu + 1e-6 * jnp.eye(u.shape[0]))
-            K_fb = - Quu_inv @ lxu.T
-            return Quu_inv, lxu, K_fb, fx, fu
-
-        # 对整条轨迹进行映射
-        def _scan_time(xs_seq, us_seq, p_single):
-            def _slice_stage(t):
-                p_t = dict(p_single["static"])
-                p_t.update(jax.tree_util.tree_map(lambda a: a[t], p_single["stage"]))
-                return p_t
-            return jax.vmap(
-                lambda t, x, u: _calc_step(x, u, _slice_stage(t)),
-                in_axes=(0, 0, 0),
-            )(jnp.arange(us_seq.shape[0]), xs_seq[:-1], us_seq)
-
-        return jax.vmap(_scan_time, in_axes=(0, 0, 0))(xs, us, params_b)
-
-    @staticmethod
-    def _static_cable_derivs(xs, us, params_b):
-        """[JAX 静态算子] 并行提取所有缆绳轨迹的导数"""
-        def _calc_step(x, u, p):
-            dyn = MPC_Planner.jax_cable_dynamics_single
-            cost = MPC_Planner.jax_cable_stage_cost
-            fx = jax.jacfwd(dyn, 0)(x, u, p)
-            fu = jax.jacfwd(dyn, 1)(x, u, p)
-            luu = jax.hessian(cost, 1)(x, u, p)
-            lxu = jax.jacfwd(jax.grad(cost, 0), 1)(x, u, p)
-            Quu_inv = jnp.linalg.inv(luu + 1e-6 * jnp.eye(u.shape[0]))
-            K_fb = - Quu_inv @ lxu.T
-            return Quu_inv, lxu, K_fb, fx, fu
-
-        def _scan_time(xs_seq, us_seq, p_single):
-            def _slice_stage(t):
-                p_t = dict(p_single["static"])
-                p_t.update(jax.tree_util.tree_map(lambda a: a[t], p_single["stage"]))
-                return p_t
-            return jax.vmap(
-                lambda t, x, u: _calc_step(x, u, _slice_stage(t)),
-                in_axes=(0, 0, 0),
-            )(jnp.arange(us_seq.shape[0]), xs_seq[:-1], us_seq)
-
-        return jax.vmap(_scan_time, in_axes=(0, 0, 0))(xs, us, params_b)
-
-
-    @staticmethod
     def _jax_load_continuous_dynamics(x, u, params):
         """连续时间负载动力学 x_dot = f(x, u)。"""
         vl = x[3:6]
@@ -693,6 +351,31 @@ class MPC_Planner:
         return scxc_traj, scuc_traj
 
 
+    # ---------------------------------------------------------------------
+    # 当前主线公共数学工具。
+    # - open_loop_penalty_jax: SubP1 / 打包阶段都会直接用到的动态 ADMM 罚权重
+    # - _q_2_rotation_jax: 当前 Julia 结果核对、SubP2 约束/残差诊断都会直接用到
+    # 这两项属于当前稳定主线公共依赖，不应该埋在后面的 legacy 区里。
+    # ---------------------------------------------------------------------
+    @staticmethod
+    def open_loop_penalty_jax(rho, gamma, a, ADMM_max):
+        """
+        [UseThis 版特有] 随迭代次数 a 变化的动态惩罚系数
+        rho: 最终权重, gamma: 陡峭度, a: 当前迭代步, ADMM_max: 总步数
+        """
+        p_min = 1e-3
+        return p_min + (rho - p_min) * 1.0 / (1.0 + jnp.exp(-gamma * (a - (ADMM_max - 1) / 2.0)))
+
+    @staticmethod
+    def _q_2_rotation_jax(q):
+        """新增的 jax 版本的四元数转旋转矩阵 无归一化版本以保持导数平滑"""
+        q0, q1, q2, q3 = q[0], q[1], q[2], q[3]
+        return jnp.array([
+            [2*(q0**2 + q1**2)-1, 2*(q1*q2 - q0*q3), 2*(q1*q3 + q0*q2)],
+            [2*(q1*q2 + q0*q3), 2*(q0**2 + q2**2)-1, 2*(q2*q3 - q0*q1)],
+            [2*(q1*q3 - q0*q2), 2*(q2*q3 + q0*q1), 2*(q0**2 + q3**2)-1]
+        ])
+
     @staticmethod
     def jax_load_stage_cost(x, u, params):
         """新增的 jax 版本的负载的单步运行代价 (Running Cost)"""
@@ -720,7 +403,7 @@ class MPC_Planner:
 
     @staticmethod
     def jax_load_terminal_cost(x, params):
-        """[修正版] 负载终点代价：统一使用 rho_lx"""
+        """负载终点代价：统一使用 rho_lx"""
         # 1. 基础误差
         diff_x_ref = x - params['ref_x']
 
@@ -735,7 +418,7 @@ class MPC_Planner:
 
     @staticmethod
     def jax_cable_stage_cost(x, u, params):
-        """[修正版] 单根缆绳单步运行代价：区分状态和控制罚项"""
+        """单根缆绳单步运行代价：区分状态和控制罚项"""
         # 1. 基础 Tracking 误差
         diff_x_ref = x - params['ref_x_i']
         diff_u_ref = u - params['ref_u_i']
@@ -758,7 +441,7 @@ class MPC_Planner:
 
     @staticmethod
     def jax_cable_terminal_cost(x, params):
-        """[修正版] 单根缆绳终点代价"""
+        """单根缆绳终点代价"""
         diff_x_ref = x - params['ref_x_i']
         # 终点通常只看状态一致性
         resid_x = x - params['scx_i'] + params['y_x_i'] / (params['rho_ix'] + 1e-6)
@@ -767,6 +450,940 @@ class MPC_Planner:
         cost += 0.5 * params['rho_ix'] * jnp.sum(resid_x**2)
 
         return cost
+
+    # 当前稳定主线会直接走这里。
+    # 这是负载侧 SubP1 的 fast path：只保留前向求解真正要用的轨迹结果，
+    # 避免把旧 DDP 路径里那些后续根本不用的导数和中间量也一起搬出来。
+    def _solve_load_subp1_forward_only(self, xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm, return_host=False):
+        """直接构造 batched tensors，只求 SubP1 轨迹，不提取未使用的导数。"""
+        N, nx, nu = int(self.N), int(self.nxl), int(self.nul)
+        weight_para = jnp.asarray(paral, dtype=jnp.float64).reshape(-1)
+        rho_lx = self.open_loop_penalty_jax(weight_para[-4], weight_para[-2], i_admm, self.max_iter_ADMM)
+        rho_lu = self.open_loop_penalty_jax(weight_para[-3], weight_para[-1], i_admm, self.max_iter_ADMM)
+
+        ref_x_traj = jnp.asarray(Ref_xl, dtype=jnp.float64).reshape(N + 1, nx)
+        ref_u_traj = jnp.asarray(Ref_ul, dtype=jnp.float64).reshape(N, nu)
+        scx_traj = jnp.asarray(scxl_traj, dtype=jnp.float64).reshape(N + 1, nx)
+        scu_traj = jnp.asarray(scul_traj, dtype=jnp.float64).reshape(N, nu)
+        yx_traj = jnp.asarray(y_xl, dtype=jnp.float64).reshape(N + 1, nx)
+        yu_traj = jnp.asarray(y_ul, dtype=jnp.float64).reshape(N, nu)
+
+        x0_b = jnp.asarray(xl_fb, dtype=jnp.float64).reshape(1, nx)
+        u_init_b = ref_u_traj[None, ...]
+        params_b = {
+            'static': {
+                'ml': jnp.full((1,), float(self.ml), dtype=jnp.float64),
+                'Jl': jnp.asarray(self.Jl, dtype=jnp.float64)[None, ...],
+                'Jl_inv': jnp.asarray(self.Jl_inv, dtype=jnp.float64)[None, ...],
+                'dt': jnp.full((1,), float(self.dt), dtype=jnp.float64),
+                'rho_lx': jnp.asarray([rho_lx], dtype=jnp.float64),
+                'rho_lu': jnp.asarray([rho_lu], dtype=jnp.float64),
+                'Q_weight': jnp.asarray(weight_para[0:nx], dtype=jnp.float64)[None, ...],
+                'R_weight': jnp.asarray(weight_para[2 * nx:2 * nx + nu], dtype=jnp.float64)[None, ...],
+                'Q_terminal_weight': jnp.asarray(weight_para[nx:2 * nx], dtype=jnp.float64)[None, ...],
+            },
+            'stage': {
+                'ref_x': ref_x_traj[:-1][None, ...],
+                'ref_u': ref_u_traj[None, ...],
+                'scx': scx_traj[:-1][None, ...],
+                'scu': scu_traj[None, ...],
+                'y_x': yx_traj[:-1][None, ...],
+                'y_u': yu_traj[None, ...],
+            },
+            'terminal': {
+                'ref_x': ref_x_traj[-1][None, ...],
+                'scx': scx_traj[-1][None, ...],
+                'y_x': yx_traj[-1][None, ...],
+            },
+        }
+
+        cfg = ILQRConfig(max_iters=10, tol_g_norm=1e-2)
+        results = self._load_solver_jit(x0_b, u_init_b, params_b, cfg=cfg)
+        if return_host:
+            xs_np = np.array(results.xs)
+            us_np = np.array(results.us)
+            return xs_np[0], us_np[0]
+        return results.xs[0], results.us[0]
+
+    # 当前稳定主线会直接走这里。
+    # 这是多机缆绳侧 SubP1 的 fast path，和上面的负载版配套。
+    # 当前 0.94s 那条主线就是靠这两个 forward-only 路径把 SubP1 压下来的。
+    def _solve_cable_subp1_forward_only(self, xq_fb, ref_xq, ref_uq, paraC, scxc_traj, scuc_traj, y_xc, y_uc, i_admm, return_host=False):
+        """直接构造 batched tensors，只求缆绳 SubP1 轨迹，不提取未使用的导数。"""
+        B, N, nx, nu = int(self.nq), int(self.N), int(self.nxi), int(self.nui)
+        weight_para = jnp.asarray(paraC, dtype=jnp.float64).reshape(-1)
+        rho_ix = self.open_loop_penalty_jax(weight_para[-4], weight_para[-2], i_admm, self.max_iter_ADMM)
+        rho_iu = self.open_loop_penalty_jax(weight_para[-3], weight_para[-1], i_admm, self.max_iter_ADMM)
+
+        x0_batch = jnp.asarray(xq_fb, dtype=jnp.float64).reshape(B, nx)
+        ref_x_batch = jnp.asarray(ref_xq, dtype=jnp.float64).reshape(B, N + 1, nx)
+        ref_u_batch = jnp.asarray(ref_uq, dtype=jnp.float64).reshape(B, nu)
+        scx_batch = jnp.asarray(scxc_traj, dtype=jnp.float64).reshape(B, N + 1, nx)
+        scu_batch = jnp.asarray(scuc_traj, dtype=jnp.float64).reshape(B, N, nu)
+        yx_batch = jnp.asarray(y_xc, dtype=jnp.float64).reshape(B, N + 1, nx)
+        yu_batch = jnp.asarray(y_uc, dtype=jnp.float64).reshape(B, N, nu)
+        u_init_batch = jnp.tile(ref_u_batch[:, None, :], (1, N, 1))
+
+        qi_weight = jnp.asarray(weight_para[0:nx], dtype=jnp.float64)
+        ri_weight = jnp.asarray(weight_para[2 * nx:2 * nx + nu], dtype=jnp.float64)
+        qi_terminal_weight = jnp.asarray(weight_para[nx:2 * nx], dtype=jnp.float64)
+        params_b = {
+            'static': {
+                'rho_ix': jnp.full((B,), rho_ix, dtype=jnp.float64),
+                'rho_iu': jnp.full((B,), rho_iu, dtype=jnp.float64),
+                'dt': jnp.full((B,), float(self.dt), dtype=jnp.float64),
+                'Qi_weight': jnp.tile(qi_weight[None, :], (B, 1)),
+                'Ri_weight': jnp.tile(ri_weight[None, :], (B, 1)),
+                'Qi_terminal_weight': jnp.tile(qi_terminal_weight[None, :], (B, 1)),
+            },
+            'stage': {
+                'ref_x_i': ref_x_batch[:, :-1, :],
+                'ref_u_i': jnp.tile(ref_u_batch[:, None, :], (1, N, 1)),
+                'scx_i': scx_batch[:, :-1, :],
+                'scu_i': scu_batch,
+                'y_x_i': yx_batch[:, :-1, :],
+                'y_u_i': yu_batch,
+            },
+            'terminal': {
+                'ref_x_i': ref_x_batch[:, -1, :],
+                'scx_i': scx_batch[:, -1, :],
+                'y_x_i': yx_batch[:, -1, :],
+            },
+        }
+
+        cfg = ILQRConfig(
+            max_iters=10,
+            tol_g_norm=1e-2,
+            reg_init=1e-6,
+            reg_mult_inc=10.0,
+            reg_mult_dec=1.0,
+            line_search_alphas=(1.0, 0.5, 0.25, 0.125, 0.0625),
+        )
+        results = self._cable_solver_jit(x0_batch, u_init_batch, params_b, cfg=cfg)
+        if return_host:
+            return np.array(results.xs), np.array(results.us)
+        return results.xs, results.us
+
+
+    @staticmethod
+    def _ipoptax_unpack(w, dims):
+        """将决策向量 w 拆解为负载和缆绳的物理量"""
+        nxl, nul, nxi, nui, nq, *_ = dims
+        xl = w[0:nxl]
+        ul = w[nxl:nxl+nul]
+        # 缆绳部分 reshape
+        rem = w[nxl+nul:].reshape(nq, nxi + nui)
+        xc_mat = rem[:, 0:nxi]
+        uc_mat = rem[:, nxi:]
+        return xl, ul, xc_mat, uc_mat
+    
+    @staticmethod
+    # 当前稳定 Julia 路线仍然会直接复用这个数学定义，
+    # 但用途主要是：
+    # - 导出 snapshot/reference 指标
+    # - 核对 Julia 解的 objective / residual
+    # 不是当前正式主线里的实际 SubP2 求解器。
+    def ipoptax_objective(w, params_t, dims):
+        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
+        active_u = 1.0 - params_t['is_terminal']
+
+        # 负载一致性项: 状态与控制分别使用 rho_lx / rho_lu
+        res_xl = xl - params_t['xl_ideal'] + params_t['y_xl'] / (params_t['rho_lx'] + 1e-6)
+        res_ul = ul - params_t['ul_ideal'] + params_t['y_ul'] / (params_t['rho_lu'] + 1e-6)
+        cost = 0.5 * params_t['rho_lx'] * jnp.sum(res_xl**2)
+        cost += active_u * 0.5 * params_t['rho_lu'] * jnp.sum(res_ul**2)
+
+        # 缆绳一致性项: 状态与控制分别使用 rho_ix / rho_iu
+        res_xc = xc_mat - params_t['xc_ideal'] + params_t['y_xc'] / (params_t['rho_ix'] + 1e-6)
+        res_uc = uc_mat - params_t['uc_ideal'] + params_t['y_uc'] / (params_t['rho_iu'] + 1e-6)
+        cost += 0.5 * params_t['rho_ix'] * jnp.sum(res_xc**2)
+        cost += active_u * 0.5 * params_t['rho_iu'] * jnp.sum(res_uc**2)
+
+        return cost
+
+    @staticmethod
+    # 同上：当前稳定 Julia 路线会复用它来算等式残差诊断，
+    # 不是当前正式主线里的实际 SubP2 求解器入口。
+    def ipoptax_equality(w, params_t, dims):
+        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
+        eqs = []
+        active_u = 1.0 - params_t['is_terminal']
+
+        # (1) 负载四元数归一化
+        ql = xl[6:10]
+        eqs.append(jnp.sum(ql**2) - 1.0)
+
+        # (2) 每根缆绳的方向向量归一化
+        di_vecs = xc_mat[:, 0:3] # (nq, 3)
+        eqs.append(jnp.sum(di_vecs**2, axis=1) - 1.0)
+
+        # (3) Wrench Consensus (力与力矩的一致性)
+        # 负载挂点位置 (ra) + 绳子方向 * 张力 = 总合力/合力矩
+        Rl = MPC_Planner._q_2_rotation_jax(ql)
+        ti_mags = xc_mat[:, 12] # 张力在状态中 (xi = [di, wi, ai, ji, ti, vti])
+        fi_inertial = di_vecs * ti_mags[:, None]
+        # 将力转到机体系计算力矩
+        fi_body = (Rl.T @ fi_inertial.T).T
+
+        # 合力一致性 (Pt 矩阵派上用场了)
+        # Pt @ [f1, f2... fn] = target_wrench (6维)
+        wrench_generated = params_t['Pt'] @ fi_body.flatten()
+        # 原版约束比较的是机体系总绳力矩与 [Rl^T*Fl, Ml]
+        Fl_body = Rl.T @ ul[0:3]
+        wrench_target = jnp.concatenate([Fl_body, ul[3:6]])
+        eqs.append(active_u * (wrench_generated - wrench_target))
+
+        return jnp.concatenate([jnp.atleast_1d(e).flatten() for e in eqs])
+
+    @staticmethod
+    # 同上：当前稳定 Julia 路线会复用它来算不等式残差诊断，
+    # 不是当前正式主线里的实际 SubP2 求解器入口。
+    def ipoptax_inequality(w, params_t, dims):
+        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
+        nq = int(dims[4])
+        num_dis = max(1, int(dims[5])) if len(dims) > 5 else 1
+        ineqs = []
+        eps_margin = 1e-2
+        active_u = 1.0 - params_t['is_terminal']
+
+        # (1) 负载避障: po >= 1e-2  <=> 1e-2 - po <= 0
+        pl = xl[0:3]
+        Rl = MPC_Planner._q_2_rotation_jax(xl[6:10])
+        di_vecs = xc_mat[:, 0:3]
+        wi_vecs = xc_mat[:, 3:6]
+        dwi_vecs = xc_mat[:, 6:9]
+        ti_mags = xc_mat[:, 12]
+        ra_mat = params_t['ra'].T
+
+        safe_r_l = params_t['ro'] + 0.5 * params_t['rq']
+        dist_l_obs1 = jnp.sum((pl[:2] - params_t['pob1'][:2])**2)
+        dist_l_obs2 = jnp.sum((pl[:2] - params_t['pob2'][:2])**2)
+        ineqs.append(safe_r_l**2 + eps_margin - dist_l_obs1)
+        ineqs.append(safe_r_l**2 + eps_margin - dist_l_obs2)
+
+        # (2) 无人机避障 (kc=num_dis 末端位置): go >= 1e-2
+        pi_mat = pl[None, :] + (Rl @ params_t['ra']).T + params_t['cl0'] * di_vecs
+        safe_r_q = params_t['ro'] + 2.0 * params_t['rq']
+        dist_to_obs1 = jnp.sum((pi_mat[:, :2] - params_t['pob1'][:2])**2, axis=1)
+        dist_to_obs2 = jnp.sum((pi_mat[:, :2] - params_t['pob2'][:2])**2, axis=1)
+        ineqs.append(safe_r_q**2 + eps_margin - dist_to_obs1)
+        ineqs.append(safe_r_q**2 + eps_margin - dist_to_obs2)
+
+        # (3) 缆绳交叉与相互间隔: gij >= 1e-2, gio 区间约束
+        pair_terms = []
+        for kc in range(1, num_dis + 1):
+            frac = float(kc) / float(num_dis)
+            pib = ra_mat + frac * params_t['cl0'] * (Rl.T @ di_vecs.T).T
+
+            min_pair_d2 = (frac * 4.0 * params_t['rq'])**2 + eps_margin
+            for i in range(nq):
+                for j in range(i + 1, nq):
+                    dij_sq = jnp.sum((pib[i, :2] - pib[j, :2])**2)
+                    pair_terms.append(min_pair_d2 - dij_sq)
+
+            if kc == num_dis:
+                ei = ra_mat / (jnp.linalg.norm(ra_mat, axis=1, keepdims=True) + 1e-9)
+                ei_pib = jnp.sum(ei[:, :2] * pib[:, :2], axis=1)
+                ineqs.append(ei_pib - (params_t['rl'] + params_t['cl0']))
+                ineqs.append((-params_t['rl']) - ei_pib)
+        if pair_terms:
+            ineqs.append(jnp.stack(pair_terms))
+
+        # (4) 张力限制 (ti_min <= ti <= ti_max)
+        ineqs.append(params_t['t_min'] - ti_mags)
+        ineqs.append(ti_mags - params_t['t_max'])
+
+        # (5) 控制上下界（原版通过 lbx/ubx 实现；这里转为不等式）
+        ineqs.append(active_u * (uc_mat - params_t['ui_bound']))
+        ineqs.append(active_u * (-uc_mat - params_t['ui_bound']))
+
+        # (6) 推力约束: 1e-2 <= ||fi||^2 <= fmax^2（terminal 步原版未显式加入）
+        wl = xl[10:13]
+        Fl = ul[0:3]
+        Ml = ul[3:6]
+        al = -params_t['g'] * jnp.array([0.0, 0.0, 1.0]) + Fl / params_t['ml']
+        awl = params_t['Jl_inv'] @ (Ml - jnp.cross(wl, params_t['Jl'] @ wl))
+
+        def _thrust_sq_i(ri, di_i, wi_i, dwi_i, ti_i):
+            rot_term = Rl @ (jnp.cross(wl, jnp.cross(wl, ri)) + jnp.cross(awl, ri))
+            cable_term = params_t['cl0'] * (
+                jnp.cross(dwi_i, di_i) + jnp.cross(wi_i, jnp.cross(wi_i, di_i))
+            )
+            fi = params_t['mq'] * (
+                al + rot_term + cable_term + params_t['g'] * jnp.array([0.0, 0.0, 1.0])
+            ) + di_i * ti_i
+            return jnp.sum(fi**2)
+
+        thrust_sq = jax.vmap(_thrust_sq_i)(ra_mat, di_vecs, wi_vecs, dwi_vecs, ti_mags)
+        ineqs.append(active_u * (thrust_sq - params_t['fmax']**2))
+        ineqs.append(active_u * (eps_margin - thrust_sq))
+
+        return jnp.concatenate([jnp.atleast_1d(i).flatten() for i in ineqs])
+
+    # 当前稳定主线会直接复用这个解包函数。
+    # 不管 SubP2 是纯 JAX 还是外部 Julia worker 解出来的，只要返回的是 batch 决策变量，
+    # 最后都要靠这里还原成 scxl/scul/scxc/scuc 轨迹格式。
+    def _unpack_subp2_results(self, w_opt_batch):
+        """
+        [JAX 血管函数] 将 SubP2 并行算出的 Tensor 拆解回 ADMM 轨迹格式
+        w_opt_batch shape: (N+1, Total_Dim)
+        """
+        N, nq = self.N, int(self.nq)
+        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
+
+        # 1. 拆解负载 (Payload) 部分
+        scxl_traj = w_opt_batch[:, 0:nxl] # (N+1, 13)
+        scul_traj = w_opt_batch[:N, nxl:nxl+nul] # (N, 6) 控制量只取前 N 个
+
+        # 2. 拆解缆绳 (Cables) 部分
+        # 把剩下的变量 reshape 为 (N+1, nq, nxi + nui)
+        cables_part = w_opt_batch[:, nxl+nul:].reshape(N + 1, nq, nxi + nui)
+
+        # 分离状态和控制
+        scxc_batch = cables_part[:, :, 0:nxi] # (N+1, nq, nxi)
+        scuc_batch = cables_part[:N, :, nxi:] # (N, nq, 4)
+
+        # 为了兼容原版代码中 list of arrays 的习惯，我们进行最后的转换
+        scxc_traj_list = []
+        scuc_traj_list = []
+        for i in range(nq):
+            # scxc_traj_list 里的每个元素是 (N+1, nxi)
+            scxc_traj_list.append(np.array(scxc_batch[:, i, :]))
+            # scuc_traj_list 里的每个元素是 (N, 4)
+            scuc_traj_list.append(np.array(scuc_batch[:, i, :]))
+
+        return {
+            'scxl_traj': np.array(scxl_traj),
+            'scul_traj': np.array(scul_traj),
+            'scxc_traj': scxc_traj_list,
+            'scuc_traj': scuc_traj_list
+        }
+
+    # 当前稳定主线会间接走这里。
+    # 这是 SubP2 batch 语义的最低层构造器：给定 SubP1 结果、参考轨迹、对偶变量和 rho，
+    # 统一整理成两份东西：
+    # 1. w_init: 每个时间步一个扁平决策向量初值，形状 (N+1, total_dim)
+    # 2. params_batch: 每个时间步对应的一整包参数，供 pure JAX / Julia 两条 SubP2 路线复用
+    #
+    # 这里的“规范形状”非常重要：
+    # - 时间维永远放第一维，方便后续按 step 做 vmap / threaded solve
+    # - 缆绳相关量统一整理成 (N+1, nq, ...)，避免不同调用方自己猜转置方向
+    # - 控制量、控制对偶在 terminal 步都补 0，保持每个 step 的字段形状完全一致
+    def _build_subp2_batch_from_components(
+        self,
+        xl_ideal,
+        ul_ideal,
+        xc_ideal,
+        uc_ideal,
+        Ref_xl,
+        Ref_ul,
+        ref_xq,
+        ref_uq,
+        y_xl,
+        y_ul,
+        y_xc,
+        y_uc,
+        rho_lx,
+        rho_lu,
+        rho_ix,
+        rho_iu,
+        admm_iter,
+    ):
+        N, nq = self.N, int(self.nq)
+        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
+
+        # --- 1. 把所有输入都标准化成明确的 dense tensor 形状 ---
+        # 这里先保留“调用方最自然的输入布局”：
+        # - 负载量通常已经是 (N+1, *) / (N, *)
+        # - 缆绳量通常还是 (nq, N+1, *) / (nq, N, *)
+        ref_xl = jnp.asarray(Ref_xl, dtype=jnp.float64).reshape(N + 1, nxl)
+        ref_ul = jnp.asarray(Ref_ul, dtype=jnp.float64).reshape(N, nul)
+        ref_xq_batch = jnp.asarray(ref_xq, dtype=jnp.float64).reshape(nq, N + 1, nxi)
+        ref_uq_batch = jnp.asarray(ref_uq, dtype=jnp.float64).reshape(nq, nui)
+
+        xl_ideal_arr = jnp.asarray(xl_ideal, dtype=jnp.float64).reshape(N + 1, nxl)
+        ul_ideal_arr = jnp.asarray(ul_ideal, dtype=jnp.float64).reshape(N, nul)
+        xc_ideal_arr = jnp.asarray(xc_ideal, dtype=jnp.float64).reshape(nq, N + 1, nxi)
+        uc_ideal_arr = jnp.asarray(uc_ideal, dtype=jnp.float64).reshape(nq, N, nui)
+        y_xl_arr = jnp.asarray(y_xl, dtype=jnp.float64).reshape(N + 1, nxl)
+        y_ul_arr = jnp.asarray(y_ul, dtype=jnp.float64).reshape(N, nul)
+        y_xc_arr = jnp.asarray(y_xc, dtype=jnp.float64).reshape(nq, N + 1, nxi)
+        y_uc_arr = jnp.asarray(y_uc, dtype=jnp.float64).reshape(nq, N, nui)
+
+        # --- 2. 组装按“时间步”为中心的 params_batch ---
+        # 这是后续 SubP2 单步 evaluator / 单步求解器真正要读的参数表。
+        # 每个字段都做成 (N+1, ...) 的形式，这样第 t 步只要索引 params_batch[field][t] 即可。
+        params_batch = {
+            # 标量型 ADMM/物理参数：直接沿时间维广播成 (N+1,)
+            'rho_lx': jnp.full((N + 1,), rho_lx),
+            'rho_lu': jnp.full((N + 1,), rho_lu),
+            'rho_ix': jnp.full((N + 1,), rho_ix),
+            'rho_iu': jnp.full((N + 1,), rho_iu),
+            'admm_iter': jnp.full((N + 1,), admm_iter),
+            'admm_total': jnp.full((N + 1,), float(self.max_iter_ADMM)),
+            'rl': jnp.full((N + 1,), self.rl),
+            'ro': jnp.full((N + 1,), self.ro),
+            'rq': jnp.full((N + 1,), self.rq),
+            'cl0': jnp.full((N + 1,), self.cl0),
+            'p_bar': jnp.full((N + 1,), self.p_bar),
+            'ml': jnp.full((N + 1,), self.ml),
+            'mq': jnp.full((N + 1,), self.mq),
+            'fmax': jnp.full((N + 1,), self.fmax),
+            't_min': jnp.full((N + 1,), self.t_min),
+            't_max': jnp.full((N + 1,), self.t_max),
+            'ui_bound': jnp.full((N + 1,), self.ui_bound),
+            'g': jnp.full((N + 1,), self.g),
+            # terminal mask 让单步 evaluator 能区分最后一步哪些控制项应当失活。
+            'is_terminal': jnp.concatenate([jnp.zeros((N,)), jnp.ones((1,))], axis=0),
+            'eq_scale': jnp.full((N + 1,), 1e-1),
+            'ineq_scale': jnp.full((N + 1,), 1e-2),
+            # 矩阵型静态量：复制到每个时间步，避免后面每步再做广播/闭包捕获。
+            'Pt': jnp.tile(self.Pt[None, ...], (N + 1, 1, 1)),
+            'ra': jnp.tile(self.ra[None, ...], (N + 1, 1, 1)),
+            'Jl': jnp.tile(self.Jl[None, ...], (N + 1, 1, 1)),
+            'Jl_inv': jnp.tile(self.Jl_inv[None, ...], (N + 1, 1, 1)),
+            'pob1': jnp.tile(self.pob1[None, ...], (N + 1, 1)),
+            'pob2': jnp.tile(self.pob2[None, ...], (N + 1, 1)),
+            # “ideal” 是当前轮 SubP1 给出的引导轨迹。
+            # 对缆绳量要转成 (time, nq, dim)，这样每个 step 取出来就是该时刻所有无人机的数据。
+            'xl_ideal': xl_ideal_arr,
+            'ul_ideal': jnp.concatenate([ul_ideal_arr, jnp.zeros((1, nul), dtype=ul_ideal_arr.dtype)], axis=0),
+            'xc_ideal': xc_ideal_arr.transpose(1, 0, 2),
+            'uc_ideal': jnp.concatenate([uc_ideal_arr, jnp.zeros((nq, 1, nui), dtype=uc_ideal_arr.dtype)], axis=1).transpose(1, 0, 2),
+            # “ref” 是 reference-based init / tracking 目标。
+            # 当前 SubP2 仍然沿用“用参考轨迹做 x0”的习惯，而不是直接拿 ideal 当初值。
+            'xl_ref': ref_xl,
+            'ul_ref': jnp.concatenate([ref_ul, jnp.zeros((1, nul), dtype=ref_ul.dtype)], axis=0),
+            'xc_ref': ref_xq_batch.transpose(1, 0, 2),
+            'uc_ref': jnp.tile(ref_uq_batch[None, :, :], (N + 1, 1, 1)),
+            # 对偶变量同样整理成按时间步读取的布局；terminal 控制对偶补 0。
+            'y_xl': y_xl_arr,
+            'y_ul': jnp.concatenate([y_ul_arr, jnp.zeros((1, nul), dtype=y_ul_arr.dtype)], axis=0),
+            'y_xc': y_xc_arr.transpose(1, 0, 2),
+            'y_uc': jnp.concatenate([y_uc_arr, jnp.zeros((nq, 1, nui), dtype=y_uc_arr.dtype)], axis=1).transpose(1, 0, 2),
+        }
+
+        # --- 3. 构造每个时间步的扁平初值 w_init ---
+        # _ipoptax_unpack / Julia 单步模型都默认扁平变量顺序是：
+        # [负载状态 xl, 负载控制 ul, (每架无人机的 [xi, ui] 交错拼接)]
+        # 因此这里必须先把每架无人机的 (xc_ref, uc_ref) 按最后一维拼好，再整体 flatten。
+        cables_init = jnp.concatenate([params_batch['xc_ref'], params_batch['uc_ref']], axis=2)
+        w_init = jnp.concatenate(
+            [params_batch['xl_ref'], params_batch['ul_ref'], cables_init.reshape(N + 1, -1)],
+            axis=1,
+        )
+        return w_init, params_batch
+
+
+    # 当前稳定主线会直接复用这个打包函数。
+    # 纯 JAX SubP2 和 persistent Julia SubP2 共用同一份 batch 组织方式，
+    # 区别只在于 batch 是交给 JAX solver 还是通过 IPC 送到 Julia worker。
+    def _prepare_subp2_batch(self, Para2):
+        """
+        [JAX 血管函数] 为并行 ipoptax 准备全时域 Batch 数据
+        """
+        # 先看上游是否已经把本轮 SubP2 真正要吃的标准 batch 输入预构好了。
+        # 注意：这不是“跨 ADMM 轮缓存旧结果”，因为每一轮的 ideal / y / rho 都会变。
+        # 它只是“同一轮里提前构好的 (w_init, params_batch)”：
+        # - _pack_para2 已经顺手把这轮 batch 拼好了
+        # - 这里如果直接命中，就不用再从 Para2 各字段重组第二遍
+        # 当前稳定主线（persistent Julia runner）通常都会命中这里。
+        prebuilt = Para2.get('_prebuilt_subp2_batch', None)
+        if prebuilt is not None:
+            return prebuilt
+        N, nq = self.N, int(self.nq)
+        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
+
+        # 走到这里说明调用方没有提供 _prebuilt_subp2_batch。
+        # 下面这整段 fallback 重建逻辑主要是为了兼容旧路径/实验分支：
+        # - pure JAX SubP2
+        # - SQP / barrier 试验分支
+        # - 手工构造 Para2 的诊断脚本
+        # 对当前稳定主线来说，这一大段通常不是必经热路径。
+        # --- 1. 基础物理量提取与广播 ---
+        # 我们把这些静态常数复制 N+1 份，方便 vmap 同时读取
+        params_batch = {
+            'rho_lx': jnp.full((N+1,), Para2['rho_lx']),
+            'rho_lu': jnp.full((N+1,), Para2['rho_lu']),
+            'rho_ix': jnp.full((N+1,), Para2['rho_ix']),
+            'rho_iu': jnp.full((N+1,), Para2['rho_iu']),
+            'admm_iter': jnp.full((N+1,), Para2.get('admm_iter', 0.0)),
+            'admm_total': jnp.full((N+1,), Para2.get('admm_total', float(self.max_iter_ADMM))),
+            'rl':    jnp.full((N+1,), self.rl),
+            'ro':    jnp.full((N+1,), self.ro),
+            'rq':    jnp.full((N+1,), self.rq),
+            'cl0':   jnp.full((N+1,), self.cl0),
+            'p_bar': jnp.full((N+1,), self.p_bar),
+            'ml':    jnp.full((N+1,), self.ml),
+            'mq':    jnp.full((N+1,), self.mq),
+            'fmax':  jnp.full((N+1,), self.fmax),
+            't_min': jnp.full((N+1,), self.t_min),
+            't_max': jnp.full((N+1,), self.t_max),
+            'ui_bound': jnp.full((N+1,), self.ui_bound),
+            'g':     jnp.full((N+1,), self.g),
+            'is_terminal': jnp.concatenate([jnp.zeros((N,)), jnp.ones((1,))], axis=0),
+            'eq_scale': jnp.full((N+1,), 1e-1),
+            'ineq_scale': jnp.full((N+1,), 1e-2),
+
+            # 广播 2D/3D 矩阵
+            'Pt':    jnp.tile(self.Pt[None, ...], (N+1, 1, 1)),
+            'ra':    jnp.tile(self.ra[None, ...], (N+1, 1, 1)),
+            'Jl':    jnp.tile(self.Jl[None, ...], (N+1, 1, 1)),
+            'Jl_inv': jnp.tile(self.Jl_inv[None, ...], (N+1, 1, 1)),
+            'pob1':  jnp.tile(self.pob1[None, ...], (N+1, 1)),
+            'pob2':  jnp.tile(self.pob2[None, ...], (N+1, 1)),
+
+            # 提取 DDP 算出的理想值 (作为引导)
+            'xl_ideal': jnp.array(Para2['xl_ideal']), # (N+1, 13)
+            # 控制量补齐第 N+1 个点
+            'ul_ideal': jnp.concatenate([jnp.array(Para2['ul_ideal']), jnp.zeros((1, nul))], axis=0), # (N+1, 6)
+            # 缆绳部分：必须转置，确保时间维在第一位
+            'xc_ideal': jnp.array(Para2['xc_ideal']).transpose(1, 0, 2), # (N+1, nq, nxi)
+            'uc_ideal': jnp.concatenate([jnp.array(Para2['uc_ideal']), jnp.zeros((nq, 1, nui))], axis=1).transpose(1, 0, 2), # (N+1, nq, 4)
+
+            # 对齐原版 IPOPT：SubP2 的 x0 使用参考轨迹
+            'xl_ref': jnp.array(Para2['xl_ref']), # (N+1, nxl)
+            'ul_ref': jnp.concatenate([jnp.array(Para2['ul_ref']), jnp.zeros((1, nul))], axis=0), # (N+1, nul)
+            'xc_ref': jnp.array(Para2['xc_ref']).transpose(1, 0, 2), # (N+1, nq, nxi)
+            'uc_ref': jnp.tile(jnp.array(Para2['uc_ref_single'])[None, :, :], (N + 1, 1, 1)), # (N+1, nq, nui)
+
+            # 提取当前的对偶变量
+            'y_xl': jnp.array(Para2['y_xl']), # (N+1, 13)
+            'y_ul': jnp.concatenate([jnp.array(Para2['y_ul']), jnp.zeros((1, nul))], axis=0), # (N+1, 6)
+            'y_xc': jnp.array(Para2['y_xc']).transpose(1, 0, 2), # (N+1, nq, nxi)
+            'y_uc': jnp.concatenate([jnp.array(Para2['y_uc']), jnp.zeros((nq, 1, nui))], axis=1).transpose(1, 0, 2)  # (N+1, nq, 4)
+        }
+
+        # --- 2. 构造 w_init (每一行代表一个时刻的初始猜想) ---
+
+        # (A) 负载状态与控制（reference-based init，与原版对齐）
+        xl_init = params_batch['xl_ref']
+        ul_init = params_batch['ul_ref']
+
+        # (B)(C) 缆绳状态+控制需要按每架无人机交错拼接，才能匹配 _ipoptax_unpack:
+        # rem = w[nxl+nul:].reshape(nq, nxi+nui) -> [xi_1, ui_1, xi_2, ui_2, ...]
+        cables_init = jnp.concatenate(
+            [params_batch['xc_ref'], params_batch['uc_ref']], axis=2
+        )  # (N+1, nq, nxi+nui)
+        cables_init_flat = cables_init.reshape(N + 1, -1)
+
+        # (D) 终极拼接：[负载状态, 负载控制, 逐机交错后的缆绳变量]
+        w_init = jnp.concatenate([xl_init, ul_init, cables_init_flat], axis=1)
+
+        return w_init, params_batch
+
+
+    # 当前 ADMM 前向主壳层。
+    # 这个函数本身仍属于当前稳定主线的一部分；区别在于其中的 SubP2 调用位
+    # self.jax_ADMM_SubP2(...) 会在 persistent Julia runner 里被替换成 Julia IPC 版本。
+    #
+    # 所以读当前稳定 fullflow 时，可以把这里理解成：
+    # SubP1(JAX) -> SubP2(通常已被外部替换为 Julia) -> SubP3(JAX) 的总调度器。
+    def jax_ADMM_forward_MPC(self, Ref_xl, Ref_ul, ref_xq, ref_uq, xl_fb, xq_fb, paral, parac, max_iter_ADMM):
+        """
+        [JAX 全并行版] ADMM 前向规划主流程
+        """
+        verbose = bool(getattr(self, "verbose", False))
+        def finite_str(arr):
+            a = np.asarray(arr)
+            n_fin = int(np.isfinite(a).sum())
+            return f"{n_fin}/{a.size}"
+
+        self.max_iter_ADMM = max_iter_ADMM
+        t_all = TM.time()
+        profile = {
+            "init_ms": 0.0,
+            "total_ms": 0.0,
+            "iters": [],
+        }
+        if verbose:
+            print(f"[JAX-ADMM] start: horizon={self.N}, admm_iters={max_iter_ADMM}", flush=True)
+            cable_mode = os.environ.get("JAX_CABLE_SUBP1_MODE", "batched").lower()
+            print(f"[JAX-ADMM] cable_subp1_mode={cable_mode}", flush=True)
+
+        # --- 1. 轨迹初始化 ---
+        t_init = TM.time()
+        scxl_traj, scul_traj, scxc_traj, scuc_traj = self._initialize_trajectories(Ref_xl, Ref_ul, ref_xq, ref_uq)
+        y_xl, y_ul = jnp.zeros_like(scxl_traj), jnp.zeros_like(scul_traj)
+        y_xc, y_uc = jnp.zeros_like(scxc_traj), jnp.zeros_like(scuc_traj)
+        profile["init_ms"] = (TM.time() - t_init) * 1000.0
+        if verbose:
+            print(
+                f"[JAX-ADMM] init done in {profile['init_ms']:.2f} ms | "
+                f"scxl finite={finite_str(scxl_traj)} scxc finite={finite_str(scxc_traj)}",
+                flush=True,
+            )
+
+        # --- 2. ADMM 迭代大循环 ---
+        subp2_diag_history = []
+        for i_admm in range(max_iter_ADMM):
+            t_iter = TM.time()
+            iter_profile = {
+                "admm_iter": int(i_admm),
+                "subp1_ms": 0.0,
+                "subp2_ms": 0.0,
+                "subp3_ms": 0.0,
+                "iter_total_ms": 0.0,
+            }
+            if verbose:
+                print(f"[JAX-ADMM] iter {i_admm+1}/{max_iter_ADMM} start", flush=True)
+
+            # --- (A) 子问题 1：并行 DDP 规划 ---
+            t_sp1 = TM.time()
+            subp1_fast_mode = os.environ.get("JAX_SUBP1_FORWARD_ONLY_FAST_PATH", "direct").lower()
+            cable_mode = os.environ.get("JAX_CABLE_SUBP1_MODE", "batched").lower()
+            if subp1_fast_mode in ("1", "true", "direct") and cable_mode == "batched":
+                xl_opt, ul_opt = self._solve_load_subp1_forward_only(
+                    xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm, return_host=True
+                )
+                xc_opt, uc_opt = self._solve_cable_subp1_forward_only(
+                    xq_fb, ref_xq, ref_uq, parac, scxc_traj, scuc_traj, y_xc, y_uc, i_admm, return_host=True
+                )
+                xl_opt = jnp.asarray(xl_opt, dtype=jnp.float64)
+                ul_opt = jnp.asarray(ul_opt, dtype=jnp.float64)
+                xc_opt = jnp.asarray(xc_opt, dtype=jnp.float64)
+                uc_opt = jnp.asarray(uc_opt, dtype=jnp.float64)
+            elif subp1_fast_mode == "packaged" and cable_mode == "batched":
+                # 非当前稳定主线：仍走旧 packaged SubP1 接口。
+                # 这里先把输入压成 legacy ParaL/ParaC 长向量，再交给兼容包装器拆包求解。
+                ParaL = self._pack_paraL(xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm)
+                ParaC = self._pack_paraC(xq_fb, ref_xq, ref_uq, parac, scxc_traj, scuc_traj, y_xc, y_uc, i_admm)
+
+                sol1_load, _ = self.jax_MPC_Load_DDP_Planning_SubP1(ParaL, need_derivs=False)
+                sol1_cable, _ = self.jax_MPC_Cable_DDP_Planning_SubP1(ParaC, need_derivs=False)
+
+                xl_opt = sol1_load['xl_traj'][0]
+                ul_opt = sol1_load['ul_traj'][0]
+                xc_opt = jnp.array(sol1_cable['xc_traj']) # (nq, N+1, nxi)
+                uc_opt = jnp.array(sol1_cable['uc_traj']) # (nq, N, 4)
+            else:
+                # 非当前稳定主线 fallback：保留旧 ParaL/ParaC 打包和 packaged SubP1 入口。
+                ParaL = self._pack_paraL(xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm)
+                ParaC = self._pack_paraC(xq_fb, ref_xq, ref_uq, parac, scxc_traj, scuc_traj, y_xc, y_uc, i_admm)
+
+                sol1_load, _ = self.jax_MPC_Load_DDP_Planning_SubP1(ParaL)
+                sol1_cable, _ = self.jax_MPC_Cable_DDP_Planning_SubP1(ParaC)
+
+                xl_opt = sol1_load['xl_traj'][0]
+                ul_opt = sol1_load['ul_traj'][0]
+                xc_opt = jnp.array(sol1_cable['xc_traj']) # (nq, N+1, nxi)
+                uc_opt = jnp.array(sol1_cable['uc_traj']) # (nq, N, 4)
+            iter_profile["subp1_ms"] = (TM.time() - t_sp1) * 1000.0
+            if verbose:
+                print(
+                    f"[JAX-ADMM] iter {i_admm+1} subp1 done in {iter_profile['subp1_ms']:.2f} ms | "
+                    f"xl={finite_str(xl_opt)} xc={finite_str(xc_opt)}",
+                    flush=True,
+                )
+
+            # --- (B) 子问题 2：并行一致性投影 (ipoptax) ---
+            t_sp2 = TM.time()
+            Para2 = self._pack_para2(
+                xl_opt, ul_opt, xc_opt, uc_opt,
+                Ref_xl, Ref_ul, ref_xq, ref_uq,
+                y_xl, y_ul, y_xc, y_uc, paral, parac, i_admm
+            )
+            sol2 = self.jax_ADMM_SubP2(Para2)
+            subp2_diag_history.append(sol2.get('diag', {}))
+
+            scxl_cons = sol2['scxl_traj']
+            scul_cons = sol2['scul_traj']
+            scxc_cons = jnp.array(sol2['scxc_traj'])
+            scuc_cons = jnp.array(sol2['scuc_traj'])
+            iter_profile["subp2_ms"] = (TM.time() - t_sp2) * 1000.0
+            if verbose:
+                print(
+                    f"[JAX-ADMM] iter {i_admm+1} subp2 done in {iter_profile['subp2_ms']:.2f} ms | "
+                    f"scxl={finite_str(scxl_cons)} scxc={finite_str(scxc_cons)}",
+                    flush=True,
+                )
+
+            # --- (C) 子问题 3：对偶变量更新 ---
+            # 调用我们之前改好的 JAX 版 SubP3
+            t_sp3 = TM.time()
+            sol3 = self.jax_ADMM_SubP3(
+                xl_opt, scxl_cons, y_xl, ul_opt, scul_cons, y_ul,
+                xc_opt, scxc_cons, y_xc, uc_opt, scuc_cons, y_uc,
+                paral[-4], paral[-3], paral[-2], paral[-1],
+                parac[-4], parac[-3], parac[-2], parac[-1],
+                max_iter_ADMM, i_admm
+            )
+
+            # 更新对偶变量，存入下一轮
+            y_xl, y_ul = sol3['scxL_traj_new'], sol3['scuL_traj_new']
+            y_xc, y_uc = sol3['scxC_traj_new'], sol3['scuC_traj_new']
+
+            # 同时更新 SubP2 用的共识变量
+            scxl_traj, scul_traj = scxl_cons, scul_cons
+            scxc_traj, scuc_traj = scxc_cons, scuc_cons
+            iter_profile["subp3_ms"] = (TM.time() - t_sp3) * 1000.0
+            iter_profile["iter_total_ms"] = (TM.time() - t_iter) * 1000.0
+            profile["iters"].append(iter_profile)
+            if verbose:
+                print(
+                    f"[JAX-ADMM] iter {i_admm+1} subp3 done in {iter_profile['subp3_ms']:.2f} ms | "
+                    f"y_xl={finite_str(y_xl)} y_xc={finite_str(y_xc)}",
+                    flush=True,
+                )
+                print(
+                    f"[JAX-ADMM] iter {i_admm+1} total {iter_profile['iter_total_ms']:.2f} ms",
+                    flush=True,
+                )
+
+            # --- (D) 收敛性检查 ---
+            # ...
+
+        profile["total_ms"] = (TM.time() - t_all) * 1000.0
+        if verbose:
+            print(f"[JAX-ADMM] finished in {profile['total_ms'] / 1000.0:.2f} s", flush=True)
+
+        return {
+            'load_trajectory': xl_opt,
+            'cable_trajectories': xc_opt,
+            'control_inputs': ul_opt,
+            'subp2_diag_history': subp2_diag_history,
+            'profile': profile,
+        }
+
+    # 当前稳定主线会直接走这里。
+    # 这一步负责生成 ADMM 第 0 轮使用的共识初值，也是后面 benchmark 里 init_ms 的来源。
+    def _initialize_trajectories(self, Ref_xl, Ref_ul, ref_xq, ref_uq):
+        """
+        [JAX 移植版] 轨迹初始化逻辑 (严格对应原版 L1624-L1650)
+        """
+        N, nq = self.N, self.nq
+        params = self._get_static_params()
+
+        # 原版 ADMM_forward_MPC 的 safe-copy 初始化并不是整条 rollout：
+        # 每个时刻都从该切片当前值（初始全零）做一次单步动力学，terminal 保持为零。
+        # 这里故意保留这个“坏初值”行为，先确保 forward 逻辑一致。
+        ref_ul_seq = jnp.asarray(Ref_ul).reshape(N, self.nul)
+        scxl_traj = self._init_load_traj_jit(ref_ul_seq, params, self.nxl)
+        scul_traj = ref_ul_seq
+
+        # 缆绳侧同理：每个时刻从零状态单独推进一步，terminal 保持为零。
+        ref_uq_mat = jnp.asarray(ref_uq).reshape(nq, self.nui)
+        scxc_traj, scuc_traj = self._init_cable_traj_jit(
+            ref_uq_mat,
+            params,
+            self.nxi,
+            N,
+        )
+
+        return scxl_traj, scul_traj, scxc_traj, scuc_traj
+
+    def _get_static_params(self):
+        """[JAX 血管函数] 返回 JAX 算子需要的静态物理字典"""
+        cached = getattr(self, "_static_params_cache", None)
+        if cached is None:
+            cached = {
+                'ml': float(self.ml),
+                'dt': float(self.dt),
+                'Jl': jnp.array(self.Jl, dtype=jnp.float64),
+                'Jl_inv': jnp.array(self.Jl_inv, dtype=jnp.float64),
+                'g': 9.81,
+                'ez': jnp.array([0.0, 0.0, 1.0], dtype=jnp.float64)
+            }
+            self._static_params_cache = cached
+        return cached
+
+    # 当前稳定主线会直接走这里。
+    # 这是新的 SubP2 输入构造器：不再沿用 ParaL/ParaC 那种 legacy 长向量接口，
+    # 而是把 SubP1 输出、参考轨迹、对偶变量和 rho 组织成结构化字典。
+    # persistent Julia runner 和纯 JAX SubP2 都复用这层语义。
+    def _pack_para2(self, xl_opt, ul_opt, xc_opt, uc_opt,
+                    Ref_xl, Ref_ul, ref_xq, ref_uq,
+                    y_xl, y_ul, y_xc, y_uc, paral, paraC, i_admm):
+        # 这一步是“上层 ADMM 语义 -> SubP2 输入语义”的适配层。
+        # 它返回的 Para2 仍然是一个 Python dict，原因有两个：
+        # 1. 纯 JAX SubP2 历史分支还能直接消费它；
+        # 2. persistent Julia runner 可以优先取走里面已经预构好的 _prebuilt_subp2_batch，
+        #    从而避免每轮再在 Python 里重复做一次 batch 组织。
+
+        # --- 1. 先把 reference 轨迹整理成清晰的 numpy 形状 ---
+        # 这些字段保存在 Para2 里，既方便诊断，也方便 _prepare_subp2_batch fallback 时重建。
+        xl_ref_mat = np.array(Ref_xl).reshape(self.N + 1, self.nxl)
+        ul_ref_mat = np.array(Ref_ul).reshape(self.N, self.nul)
+        xc_ref = np.array([np.array(ref_xq[i]).reshape(self.N + 1, self.nxi) for i in range(self.nq)])
+        uc_ref_single = np.array(ref_uq).reshape(self.nq, self.nui)
+
+        # --- 2. 根据当前 ADMM 轮的超参数，先算出本轮真正使用的 rho ---
+        # 这里不能直接把 paral/paraC 原样塞下去，因为 SubP2 关心的是“这一轮展开后的 rho 值”，
+        # 不是生成 rho 的超参数本身。
+        rho_lx = self.open_loop_penalty_jax(paral[-4], paral[-2], i_admm, self.max_iter_ADMM)
+        rho_lu = self.open_loop_penalty_jax(paral[-3], paral[-1], i_admm, self.max_iter_ADMM)
+        rho_ix = self.open_loop_penalty_jax(paraC[-4], paraC[-2], i_admm, self.max_iter_ADMM)
+        rho_iu = self.open_loop_penalty_jax(paraC[-3], paraC[-1], i_admm, self.max_iter_ADMM)
+
+        # --- 3. 直接预构一份“规范 batch” ---
+        # 当前稳定 Julia 路线会优先复用这份结果；这样后续 runner 不用再靠 Para2 各字段重新拼一次。
+        prebuilt_batch = self._build_subp2_batch_from_components(
+            xl_opt, ul_opt, xc_opt, uc_opt,
+            Ref_xl, Ref_ul, ref_xq, ref_uq,
+            y_xl, y_ul, y_xc, y_uc,
+            rho_lx, rho_lu, rho_ix, rho_iu,
+            float(i_admm),
+        )
+
+        # --- 4. 返回结构化 Para2 字典 ---
+        # 这里保留两层语义：
+        # - 上层易读字段（ideal/ref/y/rho/...），方便日志、诊断和 fallback 重建
+        # - _prebuilt_subp2_batch，方便当前稳定 Julia 主线直接取走
+        return {
+            # ideal: 当前轮 SubP1 给出的引导轨迹
+            'xl_ideal': xl_opt,  # (N+1, nxl)
+            'ul_ideal': ul_opt,  # (N, nul)
+            'xc_ideal': xc_opt,  # (nq, N+1, nxi)
+            'uc_ideal': uc_opt,  # (nq, N, nui)
+            # ref: 参考轨迹 / 参考控制
+            'xl_ref': xl_ref_mat,           # (N+1, nxl)
+            'ul_ref': ul_ref_mat,           # (N, nul)
+            'xc_ref': xc_ref,               # (nq, N+1, nxi)
+            'uc_ref_single': uc_ref_single, # (nq, nui)
+            # 当前 ADMM 对偶变量
+            'y_xl': y_xl,
+            'y_ul': y_ul,
+            'y_xc': y_xc,
+            'y_uc': y_uc,
+            # 当前轮已经展开好的 rho
+            'rho_lx': rho_lx,
+            'rho_lu': rho_lu,
+            'rho_ix': rho_ix,
+            'rho_iu': rho_iu,
+            # 运行时辅助信息
+            'admm_iter': float(i_admm),
+            'admm_total': float(self.max_iter_ADMM),
+            'pob1': self.pob1,
+            'pob2': self.pob2,
+            # 当前主线优先复用的规范 batch：
+            # prebuilt_batch = (w_init, params_batch)
+            '_prebuilt_subp2_batch': prebuilt_batch,
+        }
+
+
+    @staticmethod
+    def jax_subp3_update(xl_opt, scxl_cons, y_xl_old, rho_lx, ul_opt, scul_cons, y_ul_old, rho_lu):
+        """
+        [JAX 版] 负载对偶变量更新
+        """
+        # 对偶变量更新公式：y_new = y_old + rho * (primal - consensus)
+        y_xl_new = y_xl_old + rho_lx * (xl_opt - scxl_cons)
+        y_ul_new = y_ul_old + rho_lu * (ul_opt - scul_cons)
+        return y_xl_new, y_ul_new
+
+    @staticmethod
+    def jax_subp3_update_cable(xc_opt, scxc_cons, y_xc_old, rho_ix, uc_opt, scuc_cons, y_uc_old, rho_iu):
+        """
+        [JAX 版] 缆绳对偶变量并行更新 (利用 JAX 的自动广播机制)
+        """
+        y_xc_new = y_xc_old + rho_ix * (xc_opt - scxc_cons)
+        y_uc_new = y_uc_old + rho_iu * (uc_opt - scuc_cons)
+        return y_xc_new, y_uc_new
+
+    def jax_ADMM_SubP3(self, xl_traj, scxl_traj, scxL_traj, ul_traj, scul_traj, scuL_traj,
+                  xc_traj, scxc_traj, scxC_traj, uc_traj, scuc_traj, scuC_traj,
+                  px, pu, gammax, gammau, pix, piu, gammaix, gammaiu, ADMM_max, i_admm):
+        """
+        子问题 3 的类成员包装器
+        """
+        # 1. 计算当前步的动态惩罚系数
+        rho_lx = self.open_loop_penalty_jax(px, gammax, i_admm, ADMM_max)
+        rho_lu = self.open_loop_penalty_jax(pu, gammau, i_admm, ADMM_max)
+
+        # 2. 调用 JAX 纯函数更新负载对偶变量
+        y_xl_new, y_ul_new = self.jax_subp3_update(
+            xl_traj, scxl_traj, scxL_traj, rho_lx,
+            ul_traj, scul_traj, scuL_traj, rho_lu
+        )
+
+        # 3. 计算缆绳的动态惩罚 (对每一个无人机)
+        # 假设所有无人机共享这套参数，JAX 会处理广播
+        rho_ix = self.open_loop_penalty_jax(pix, gammaix, i_admm, ADMM_max)
+        rho_iu = self.open_loop_penalty_jax(piu, gammaiu, i_admm, ADMM_max)
+
+        # 4. 调用 JAX 纯函数更新缆绳对偶变量
+        y_xc_new, y_uc_new = self.jax_subp3_update_cable(
+            xc_traj, scxc_traj, scxC_traj, rho_ix,
+            uc_traj, scuc_traj, scuC_traj, rho_iu
+        )
+
+        return {
+            'scxL_traj_new': np.array(y_xl_new),
+            'scuL_traj_new': np.array(y_ul_new),
+            'scxC_traj_new': np.array(y_xc_new),
+            'scuC_traj_new': np.array(y_uc_new)
+        }
+    # ---------------------------------------------------------------------
+    # 以下是下沉后的"非当前稳定主线"方法区。
+    # 先是旧 SubP1 packaged / derivs / legacy 分支，再往后才是 pure JAX SubP2 实验区。
+    # 当前 persistent Julia 主线默认不直接走这里。
+    # ---------------------------------------------------------------------
+
+    # ---------------------------------------------------------------------
+    # 非当前稳定主线：SubP1 的旧 packaged / derivs / legacy 分支。
+    # 这些方法保留是为了兼容旧接口、导出导数、以及和 legacy DDP 做对照。
+    # ---------------------------------------------------------------------
+    @staticmethod
+    # 非当前稳定主线默认热路径。
+    # 只有在旧 packaged SubP1 路径、对齐/诊断实验，或显式 need_derivs=True 时，
+    # 才需要沿已求出的轨迹额外提取 Fx/Fu/Qxu/Quu_inv/K_FB 这些导数量。
+    def _static_load_derivs(xs, us, params_b):
+        """[JAX 静态算子] 批量提取负载轨迹导数，仅供 need_derivs/旧路径使用"""
+        def _calc_step(x, u, p):
+            dyn = MPC_Planner.jax_load_dynamics
+            cost = MPC_Planner.jax_load_stage_cost
+            # 计算动力学 Jacobian
+            fx = jax.jacfwd(dyn, 0)(x, u, p)
+            fu = jax.jacfwd(dyn, 1)(x, u, p)
+            # 计算代价函数 Hessian 和 Jacobian (用于反馈增益 K_fb)
+            luu = jax.hessian(cost, 1)(x, u, p)
+            lxu = jax.jacfwd(jax.grad(cost, 0), 1)(x, u, p)
+            # 正则化求逆 (确保数值稳定性)
+            Quu_inv = jnp.linalg.inv(luu + 1e-6 * jnp.eye(u.shape[0]))
+            K_fb = - Quu_inv @ lxu.T
+            return Quu_inv, lxu, K_fb, fx, fu
+
+        # 对整条轨迹进行映射
+        def _scan_time(xs_seq, us_seq, p_single):
+            def _slice_stage(t):
+                p_t = dict(p_single["static"])
+                p_t.update(jax.tree_util.tree_map(lambda a: a[t], p_single["stage"]))
+                return p_t
+            return jax.vmap(
+                lambda t, x, u: _calc_step(x, u, _slice_stage(t)),
+                in_axes=(0, 0, 0),
+            )(jnp.arange(us_seq.shape[0]), xs_seq[:-1], us_seq)
+
+        return jax.vmap(_scan_time, in_axes=(0, 0, 0))(xs, us, params_b)
+
+    @staticmethod
+    # 非当前稳定主线默认热路径。
+    # 作用和 _static_load_derivs 一样：在轨迹已经解出来之后，再补提一遍局部线性化/二阶信息。
+    # 当前 persistent Julia 主线默认只要 xc/uc 轨迹，不需要这里的导数包。
+    def _static_cable_derivs(xs, us, params_b):
+        """[JAX 静态算子] 批量提取缆绳轨迹导数，仅供 need_derivs/旧路径使用"""
+        def _calc_step(x, u, p):
+            dyn = MPC_Planner.jax_cable_dynamics_single
+            cost = MPC_Planner.jax_cable_stage_cost
+            fx = jax.jacfwd(dyn, 0)(x, u, p)
+            fu = jax.jacfwd(dyn, 1)(x, u, p)
+            luu = jax.hessian(cost, 1)(x, u, p)
+            lxu = jax.jacfwd(jax.grad(cost, 0), 1)(x, u, p)
+            Quu_inv = jnp.linalg.inv(luu + 1e-6 * jnp.eye(u.shape[0]))
+            K_fb = - Quu_inv @ lxu.T
+            return Quu_inv, lxu, K_fb, fx, fu
+
+        def _scan_time(xs_seq, us_seq, p_single):
+            def _slice_stage(t):
+                p_t = dict(p_single["static"])
+                p_t.update(jax.tree_util.tree_map(lambda a: a[t], p_single["stage"]))
+                return p_t
+            return jax.vmap(
+                lambda t, x, u: _calc_step(x, u, _slice_stage(t)),
+                in_axes=(0, 0, 0),
+            )(jnp.arange(us_seq.shape[0]), xs_seq[:-1], us_seq)
+
+        return jax.vmap(_scan_time, in_axes=(0, 0, 0))(xs, us, params_b)
 
     def _ensure_legacy_cable_ddp_ready(self):
         if getattr(self, "_legacy_cable_ddp_ready", False):
@@ -802,7 +1419,7 @@ class MPC_Planner:
         self._legacy_cable_ddp_ready = True
 
 
-    def _solve_cable_subp1_batched(self, ParaC, need_derivs=True):
+    def _solve_cable_subp1_batched(self, ParaC, need_derivs=False):
         B, N, nx, nu = len(ParaC), int(self.N), self.nxi, self.nui
         x0_list, u_init_list, params_list = [], [], []
 
@@ -907,10 +1524,11 @@ class MPC_Planner:
 
         return opt_solc, OPt_sol_c
 
-    def jax_MPC_Cable_DDP_Planning_SubP1(self, ParaC, need_derivs=True):
+    def jax_MPC_Cable_DDP_Planning_SubP1(self, ParaC, need_derivs=False):
         """
         [JAX] 缆绳子问题 1 求解器
         支持 `batched` / `legacy` / `compare` 三种模式。
+        当前默认只返回轨迹；只有显式 need_derivs=True 才额外提取导数包。
         """
         mode = os.environ.get("JAX_CABLE_SUBP1_MODE", "batched").lower()
         if mode == "legacy":
@@ -943,118 +1561,51 @@ class MPC_Planner:
             )
         return batched_sol
 
-    def _solve_load_subp1_forward_only(self, xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm, return_host=False):
-        """直接构造 batched tensors，只求 SubP1 轨迹，不提取未使用的导数。"""
-        N, nx, nu = int(self.N), int(self.nxl), int(self.nul)
-        weight_para = jnp.asarray(paral, dtype=jnp.float64).reshape(-1)
-        rho_lx = self.open_loop_penalty_jax(weight_para[-4], weight_para[-2], i_admm, self.max_iter_ADMM)
-        rho_lu = self.open_loop_penalty_jax(weight_para[-3], weight_para[-1], i_admm, self.max_iter_ADMM)
+    # 非当前稳定主线：旧 packaged SubP1 的负载参数打包器。
+    # 只在 jax_ADMM_forward_MPC 的 packaged/fallback 分支里使用，
+    # 目的是把当前轮负载侧输入重新压回 legacy ParaL 长向量格式。
+    def _pack_paraL(self, xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm):
+        # 负载只有一个，所以返回一个只包含一个元素的列表。
+        # 顺序必须严格匹配旧 packaged SubP1 入口的拆包顺序：
+        # 初值 -> 参考 x/u -> 共识 x/u -> 对偶 x/u -> 超参数 -> ADMM 迭代号。
+        paral_arr = np.concatenate((
+            xl_fb.flatten(),
+            Ref_xl.flatten(),
+            Ref_ul.flatten(),
+            scxl_traj.flatten(),
+            y_xl.flatten(),
+            scul_traj.flatten(),
+            y_ul.flatten(),
+            paral.flatten(),
+            [float(i_admm)]
+        ))
+        return [paral_arr]  # 返回列表以适配 B=1 的 batched packaged 接口
 
-        ref_x_traj = jnp.asarray(Ref_xl, dtype=jnp.float64).reshape(N + 1, nx)
-        ref_u_traj = jnp.asarray(Ref_ul, dtype=jnp.float64).reshape(N, nu)
-        scx_traj = jnp.asarray(scxl_traj, dtype=jnp.float64).reshape(N + 1, nx)
-        scu_traj = jnp.asarray(scul_traj, dtype=jnp.float64).reshape(N, nu)
-        yx_traj = jnp.asarray(y_xl, dtype=jnp.float64).reshape(N + 1, nx)
-        yu_traj = jnp.asarray(y_ul, dtype=jnp.float64).reshape(N, nu)
+    # 非当前稳定主线：旧 packaged SubP1 的缆绳参数打包器。
+    # 每根缆绳各自压成一个 legacy ParaC 长向量，供旧 batched 包装入口逐根拆包。
+    def _pack_paraC(self, xq_fb, ref_xq, ref_uq, paraC, scxc_traj, scuc_traj, y_xc, y_uc, i_admm):
+        ParaC_list = []
+        for i in range(self.nq):
+            # 这里的切片必须非常精准，否则旧 packaged 入口会把字段顺序读错。
+            parai = np.concatenate((
+                xq_fb[i*self.nxi : (i+1)*self.nxi],
+                ref_xq[i].flatten(),
+                ref_uq[i*self.nui : (i+1)*self.nui],
+                scxc_traj[i].flatten(),
+                y_xc[i].flatten(),
+                scuc_traj[i].flatten(),
+                y_uc[i].flatten(),
+                paraC.flatten(),
+                [float(i_admm)]
+            ))
+            ParaC_list.append(parai)
+        return ParaC_list
 
-        x0_b = jnp.asarray(xl_fb, dtype=jnp.float64).reshape(1, nx)
-        u_init_b = ref_u_traj[None, ...]
-        params_b = {
-            'static': {
-                'ml': jnp.full((1,), float(self.ml), dtype=jnp.float64),
-                'Jl': jnp.asarray(self.Jl, dtype=jnp.float64)[None, ...],
-                'Jl_inv': jnp.asarray(self.Jl_inv, dtype=jnp.float64)[None, ...],
-                'dt': jnp.full((1,), float(self.dt), dtype=jnp.float64),
-                'rho_lx': jnp.asarray([rho_lx], dtype=jnp.float64),
-                'rho_lu': jnp.asarray([rho_lu], dtype=jnp.float64),
-                'Q_weight': jnp.asarray(weight_para[0:nx], dtype=jnp.float64)[None, ...],
-                'R_weight': jnp.asarray(weight_para[2 * nx:2 * nx + nu], dtype=jnp.float64)[None, ...],
-                'Q_terminal_weight': jnp.asarray(weight_para[nx:2 * nx], dtype=jnp.float64)[None, ...],
-            },
-            'stage': {
-                'ref_x': ref_x_traj[:-1][None, ...],
-                'ref_u': ref_u_traj[None, ...],
-                'scx': scx_traj[:-1][None, ...],
-                'scu': scu_traj[None, ...],
-                'y_x': yx_traj[:-1][None, ...],
-                'y_u': yu_traj[None, ...],
-            },
-            'terminal': {
-                'ref_x': ref_x_traj[-1][None, ...],
-                'scx': scx_traj[-1][None, ...],
-                'y_x': yx_traj[-1][None, ...],
-            },
-        }
-
-        cfg = ILQRConfig(max_iters=10, tol_g_norm=1e-2)
-        results = self._load_solver_jit(x0_b, u_init_b, params_b, cfg=cfg)
-        if return_host:
-            xs_np = np.array(results.xs)
-            us_np = np.array(results.us)
-            return xs_np[0], us_np[0]
-        return results.xs[0], results.us[0]
-
-    def _solve_cable_subp1_forward_only(self, xq_fb, ref_xq, ref_uq, paraC, scxc_traj, scuc_traj, y_xc, y_uc, i_admm, return_host=False):
-        """直接构造 batched tensors，只求缆绳 SubP1 轨迹，不提取未使用的导数。"""
-        B, N, nx, nu = int(self.nq), int(self.N), int(self.nxi), int(self.nui)
-        weight_para = jnp.asarray(paraC, dtype=jnp.float64).reshape(-1)
-        rho_ix = self.open_loop_penalty_jax(weight_para[-4], weight_para[-2], i_admm, self.max_iter_ADMM)
-        rho_iu = self.open_loop_penalty_jax(weight_para[-3], weight_para[-1], i_admm, self.max_iter_ADMM)
-
-        x0_batch = jnp.asarray(xq_fb, dtype=jnp.float64).reshape(B, nx)
-        ref_x_batch = jnp.asarray(ref_xq, dtype=jnp.float64).reshape(B, N + 1, nx)
-        ref_u_batch = jnp.asarray(ref_uq, dtype=jnp.float64).reshape(B, nu)
-        scx_batch = jnp.asarray(scxc_traj, dtype=jnp.float64).reshape(B, N + 1, nx)
-        scu_batch = jnp.asarray(scuc_traj, dtype=jnp.float64).reshape(B, N, nu)
-        yx_batch = jnp.asarray(y_xc, dtype=jnp.float64).reshape(B, N + 1, nx)
-        yu_batch = jnp.asarray(y_uc, dtype=jnp.float64).reshape(B, N, nu)
-        u_init_batch = jnp.tile(ref_u_batch[:, None, :], (1, N, 1))
-
-        qi_weight = jnp.asarray(weight_para[0:nx], dtype=jnp.float64)
-        ri_weight = jnp.asarray(weight_para[2 * nx:2 * nx + nu], dtype=jnp.float64)
-        qi_terminal_weight = jnp.asarray(weight_para[nx:2 * nx], dtype=jnp.float64)
-        params_b = {
-            'static': {
-                'rho_ix': jnp.full((B,), rho_ix, dtype=jnp.float64),
-                'rho_iu': jnp.full((B,), rho_iu, dtype=jnp.float64),
-                'dt': jnp.full((B,), float(self.dt), dtype=jnp.float64),
-                'Qi_weight': jnp.tile(qi_weight[None, :], (B, 1)),
-                'Ri_weight': jnp.tile(ri_weight[None, :], (B, 1)),
-                'Qi_terminal_weight': jnp.tile(qi_terminal_weight[None, :], (B, 1)),
-            },
-            'stage': {
-                'ref_x_i': ref_x_batch[:, :-1, :],
-                'ref_u_i': jnp.tile(ref_u_batch[:, None, :], (1, N, 1)),
-                'scx_i': scx_batch[:, :-1, :],
-                'scu_i': scu_batch,
-                'y_x_i': yx_batch[:, :-1, :],
-                'y_u_i': yu_batch,
-            },
-            'terminal': {
-                'ref_x_i': ref_x_batch[:, -1, :],
-                'scx_i': scx_batch[:, -1, :],
-                'y_x_i': yx_batch[:, -1, :],
-            },
-        }
-
-        cfg = ILQRConfig(
-            max_iters=10,
-            tol_g_norm=1e-2,
-            reg_init=1e-6,
-            reg_mult_inc=10.0,
-            reg_mult_dec=1.0,
-            line_search_alphas=(1.0, 0.5, 0.25, 0.125, 0.0625),
-        )
-        results = self._cable_solver_jit(x0_batch, u_init_batch, params_b, cfg=cfg)
-        if return_host:
-            return np.array(results.xs), np.array(results.us)
-        return results.xs, results.us
-
-
-    def jax_MPC_Load_DDP_Planning_SubP1(self, ParaL, need_derivs=True):
+    def jax_MPC_Load_DDP_Planning_SubP1(self, ParaL, need_derivs=False):
         """
         [JAX] 负载子问题 1 求解器
         ParaL: 来自 ADMM 主循环的负载参数包列表 (通常 B=1)
+        当前默认只返回轨迹；只有显式 need_derivs=True 才额外提取导数包。
         """
         B, N, nx, nu = len(ParaL), int(self.N), 13, 6
         x0_list, u_guess_list, params_list = [], [], []
@@ -1161,153 +1712,18 @@ class MPC_Planner:
 
         return opt_soll, OPt_sol_l
 
+    # ---------------------------------------------------------------------
+    # 非当前稳定主线：纯 JAX SubP2 实验区。
+    # 这些方法保留是为了研究/对照，但当前 persistent Julia 主线默认不直接走。
+    # ---------------------------------------------------------------------
 
-    @staticmethod
-    def _ipoptax_unpack(w, dims):
-        """将决策向量 w 拆解为负载和缆绳的物理量"""
-        nxl, nul, nxi, nui, nq, *_ = dims
-        xl = w[0:nxl]
-        ul = w[nxl:nxl+nul]
-        # 缆绳部分 reshape
-        rem = w[nxl+nul:].reshape(nq, nxi + nui)
-        xc_mat = rem[:, 0:nxi]
-        uc_mat = rem[:, nxi:]
-        return xl, ul, xc_mat, uc_mat
-    
-    @staticmethod
-    def ipoptax_objective(w, params_t, dims):
-        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
-        active_u = 1.0 - params_t['is_terminal']
-
-        # 负载一致性项: 状态与控制分别使用 rho_lx / rho_lu
-        res_xl = xl - params_t['xl_ideal'] + params_t['y_xl'] / (params_t['rho_lx'] + 1e-6)
-        res_ul = ul - params_t['ul_ideal'] + params_t['y_ul'] / (params_t['rho_lu'] + 1e-6)
-        cost = 0.5 * params_t['rho_lx'] * jnp.sum(res_xl**2)
-        cost += active_u * 0.5 * params_t['rho_lu'] * jnp.sum(res_ul**2)
-
-        # 缆绳一致性项: 状态与控制分别使用 rho_ix / rho_iu
-        res_xc = xc_mat - params_t['xc_ideal'] + params_t['y_xc'] / (params_t['rho_ix'] + 1e-6)
-        res_uc = uc_mat - params_t['uc_ideal'] + params_t['y_uc'] / (params_t['rho_iu'] + 1e-6)
-        cost += 0.5 * params_t['rho_ix'] * jnp.sum(res_xc**2)
-        cost += active_u * 0.5 * params_t['rho_iu'] * jnp.sum(res_uc**2)
-
-        return cost
-
-    @staticmethod
-    def ipoptax_equality(w, params_t, dims):
-        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
-        eqs = []
-        active_u = 1.0 - params_t['is_terminal']
-
-        # (1) 负载四元数归一化
-        ql = xl[6:10]
-        eqs.append(jnp.sum(ql**2) - 1.0)
-
-        # (2) 每根缆绳的方向向量归一化
-        di_vecs = xc_mat[:, 0:3] # (nq, 3)
-        eqs.append(jnp.sum(di_vecs**2, axis=1) - 1.0)
-
-        # (3) Wrench Consensus (力与力矩的一致性)
-        # 负载挂点位置 (ra) + 绳子方向 * 张力 = 总合力/合力矩
-        Rl = MPC_Planner._q_2_rotation_jax(ql)
-        ti_mags = xc_mat[:, 12] # 张力在状态中 (xi = [di, wi, ai, ji, ti, vti])
-        fi_inertial = di_vecs * ti_mags[:, None]
-        # 将力转到机体系计算力矩
-        fi_body = (Rl.T @ fi_inertial.T).T
-
-        # 合力一致性 (Pt 矩阵派上用场了)
-        # Pt @ [f1, f2... fn] = target_wrench (6维)
-        wrench_generated = params_t['Pt'] @ fi_body.flatten()
-        # 原版约束比较的是机体系总绳力矩与 [Rl^T*Fl, Ml]
-        Fl_body = Rl.T @ ul[0:3]
-        wrench_target = jnp.concatenate([Fl_body, ul[3:6]])
-        eqs.append(active_u * (wrench_generated - wrench_target))
-
-        return jnp.concatenate([jnp.atleast_1d(e).flatten() for e in eqs])
-
-    @staticmethod
-    def ipoptax_inequality(w, params_t, dims):
-        xl, ul, xc_mat, uc_mat = MPC_Planner._ipoptax_unpack(w, dims)
-        nq = int(dims[4])
-        num_dis = max(1, int(dims[5])) if len(dims) > 5 else 1
-        ineqs = []
-        eps_margin = 1e-2
-        active_u = 1.0 - params_t['is_terminal']
-
-        # (1) 负载避障: po >= 1e-2  <=> 1e-2 - po <= 0
-        pl = xl[0:3]
-        Rl = MPC_Planner._q_2_rotation_jax(xl[6:10])
-        di_vecs = xc_mat[:, 0:3]
-        wi_vecs = xc_mat[:, 3:6]
-        dwi_vecs = xc_mat[:, 6:9]
-        ti_mags = xc_mat[:, 12]
-        ra_mat = params_t['ra'].T
-
-        safe_r_l = params_t['ro'] + 0.5 * params_t['rq']
-        dist_l_obs1 = jnp.sum((pl[:2] - params_t['pob1'][:2])**2)
-        dist_l_obs2 = jnp.sum((pl[:2] - params_t['pob2'][:2])**2)
-        ineqs.append(safe_r_l**2 + eps_margin - dist_l_obs1)
-        ineqs.append(safe_r_l**2 + eps_margin - dist_l_obs2)
-
-        # (2) 无人机避障 (kc=num_dis 末端位置): go >= 1e-2
-        pi_mat = pl[None, :] + (Rl @ params_t['ra']).T + params_t['cl0'] * di_vecs
-        safe_r_q = params_t['ro'] + 2.0 * params_t['rq']
-        dist_to_obs1 = jnp.sum((pi_mat[:, :2] - params_t['pob1'][:2])**2, axis=1)
-        dist_to_obs2 = jnp.sum((pi_mat[:, :2] - params_t['pob2'][:2])**2, axis=1)
-        ineqs.append(safe_r_q**2 + eps_margin - dist_to_obs1)
-        ineqs.append(safe_r_q**2 + eps_margin - dist_to_obs2)
-
-        # (3) 缆绳交叉与相互间隔: gij >= 1e-2, gio 区间约束
-        pair_terms = []
-        for kc in range(1, num_dis + 1):
-            frac = float(kc) / float(num_dis)
-            pib = ra_mat + frac * params_t['cl0'] * (Rl.T @ di_vecs.T).T
-
-            min_pair_d2 = (frac * 4.0 * params_t['rq'])**2 + eps_margin
-            for i in range(nq):
-                for j in range(i + 1, nq):
-                    dij_sq = jnp.sum((pib[i, :2] - pib[j, :2])**2)
-                    pair_terms.append(min_pair_d2 - dij_sq)
-
-            if kc == num_dis:
-                ei = ra_mat / (jnp.linalg.norm(ra_mat, axis=1, keepdims=True) + 1e-9)
-                ei_pib = jnp.sum(ei[:, :2] * pib[:, :2], axis=1)
-                ineqs.append(ei_pib - (params_t['rl'] + params_t['cl0']))
-                ineqs.append((-params_t['rl']) - ei_pib)
-        if pair_terms:
-            ineqs.append(jnp.stack(pair_terms))
-
-        # (4) 张力限制 (ti_min <= ti <= ti_max)
-        ineqs.append(params_t['t_min'] - ti_mags)
-        ineqs.append(ti_mags - params_t['t_max'])
-
-        # (5) 控制上下界（原版通过 lbx/ubx 实现；这里转为不等式）
-        ineqs.append(active_u * (uc_mat - params_t['ui_bound']))
-        ineqs.append(active_u * (-uc_mat - params_t['ui_bound']))
-
-        # (6) 推力约束: 1e-2 <= ||fi||^2 <= fmax^2（terminal 步原版未显式加入）
-        wl = xl[10:13]
-        Fl = ul[0:3]
-        Ml = ul[3:6]
-        al = -params_t['g'] * jnp.array([0.0, 0.0, 1.0]) + Fl / params_t['ml']
-        awl = params_t['Jl_inv'] @ (Ml - jnp.cross(wl, params_t['Jl'] @ wl))
-
-        def _thrust_sq_i(ri, di_i, wi_i, dwi_i, ti_i):
-            rot_term = Rl @ (jnp.cross(wl, jnp.cross(wl, ri)) + jnp.cross(awl, ri))
-            cable_term = params_t['cl0'] * (
-                jnp.cross(dwi_i, di_i) + jnp.cross(wi_i, jnp.cross(wi_i, di_i))
-            )
-            fi = params_t['mq'] * (
-                al + rot_term + cable_term + params_t['g'] * jnp.array([0.0, 0.0, 1.0])
-            ) + di_i * ti_i
-            return jnp.sum(fi**2)
-
-        thrust_sq = jax.vmap(_thrust_sq_i)(ra_mat, di_vecs, wi_vecs, dwi_vecs, ti_mags)
-        ineqs.append(active_u * (thrust_sq - params_t['fmax']**2))
-        ineqs.append(active_u * (eps_margin - thrust_sq))
-
-        return jnp.concatenate([jnp.atleast_1d(i).flatten() for i in ineqs])
-
+    # 这是"纯 JAX SubP2"总入口，不是当前稳定 persistent Julia 主线。
+    # 现在正式 benchmark 里，这个方法通常会在外部 runner 中被 monkey-patch 掉，
+    # 换成 "Python 打包 -> 常驻 Julia worker 求解 -> Python 解包" 的实现。
+    #
+    # 所以如果你只关心当前稳定主线：
+    # - 这个函数主体可先跳过
+    # - 但它依赖的 _prepare_subp2_batch / _unpack_subp2_results 仍然很重要
     def jax_ADMM_SubP2(self, Para2_dict):
         """
         [JAX 终极版] 子问题 2：利用 ipoptax 实现全时域并行硬约束优化
@@ -2090,6 +2506,8 @@ class MPC_Planner:
         }
         return result
 
+    # 可先跳过：纯 JAX SubP2 的 SQP 实验分支。
+    # 这是研究/对照路径，不是当前稳定 persistent Julia 主线。
     def jax_ADMM_SubP2_SQP(self, Para2_dict):
         N, nq = self.N, int(self.nq)
         nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
@@ -2249,6 +2667,8 @@ class MPC_Planner:
         }
         return result
 
+    # 可先跳过：纯 JAX SubP2 的 barrier 实验分支。
+    # 这也是研究/对照路径，不是当前稳定 persistent Julia 主线。
     def jax_ADMM_SubP2_BARRIER(self, Para2_dict):
         N, nq = self.N, int(self.nq)
         nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
@@ -2804,549 +3224,14 @@ class MPC_Planner:
         cache[key] = runtime
         return runtime
 
-    def _unpack_subp2_results(self, w_opt_batch):
-        """
-        [JAX 血管函数] 将 SubP2 并行算出的 Tensor 拆解回 ADMM 轨迹格式
-        w_opt_batch shape: (N+1, Total_Dim)
-        """
-        N, nq = self.N, int(self.nq)
-        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
-
-        # 1. 拆解负载 (Payload) 部分
-        scxl_traj = w_opt_batch[:, 0:nxl] # (N+1, 13)
-        scul_traj = w_opt_batch[:N, nxl:nxl+nul] # (N, 6) 控制量只取前 N 个
-
-        # 2. 拆解缆绳 (Cables) 部分
-        # 把剩下的变量 reshape 为 (N+1, nq, nxi + nui)
-        cables_part = w_opt_batch[:, nxl+nul:].reshape(N + 1, nq, nxi + nui)
-
-        # 分离状态和控制
-        scxc_batch = cables_part[:, :, 0:nxi] # (N+1, nq, nxi)
-        scuc_batch = cables_part[:N, :, nxi:] # (N, nq, 4)
-
-        # 为了兼容原版代码中 list of arrays 的习惯，我们进行最后的转换
-        scxc_traj_list = []
-        scuc_traj_list = []
-        for i in range(nq):
-            # scxc_traj_list 里的每个元素是 (N+1, nxi)
-            scxc_traj_list.append(np.array(scxc_batch[:, i, :]))
-            # scuc_traj_list 里的每个元素是 (N, 4)
-            scuc_traj_list.append(np.array(scuc_batch[:, i, :]))
-
-        return {
-            'scxl_traj': np.array(scxl_traj),
-            'scul_traj': np.array(scul_traj),
-            'scxc_traj': scxc_traj_list,
-            'scuc_traj': scuc_traj_list
-        }
-
-    def _build_subp2_batch_from_components(
-        self,
-        xl_ideal,
-        ul_ideal,
-        xc_ideal,
-        uc_ideal,
-        Ref_xl,
-        Ref_ul,
-        ref_xq,
-        ref_uq,
-        y_xl,
-        y_ul,
-        y_xc,
-        y_uc,
-        rho_lx,
-        rho_lu,
-        rho_ix,
-        rho_iu,
-        admm_iter,
-    ):
-        N, nq = self.N, int(self.nq)
-        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
-
-        ref_xl = jnp.asarray(Ref_xl, dtype=jnp.float64).reshape(N + 1, nxl)
-        ref_ul = jnp.asarray(Ref_ul, dtype=jnp.float64).reshape(N, nul)
-        ref_xq_batch = jnp.asarray(ref_xq, dtype=jnp.float64).reshape(nq, N + 1, nxi)
-        ref_uq_batch = jnp.asarray(ref_uq, dtype=jnp.float64).reshape(nq, nui)
-
-        xl_ideal_arr = jnp.asarray(xl_ideal, dtype=jnp.float64).reshape(N + 1, nxl)
-        ul_ideal_arr = jnp.asarray(ul_ideal, dtype=jnp.float64).reshape(N, nul)
-        xc_ideal_arr = jnp.asarray(xc_ideal, dtype=jnp.float64).reshape(nq, N + 1, nxi)
-        uc_ideal_arr = jnp.asarray(uc_ideal, dtype=jnp.float64).reshape(nq, N, nui)
-        y_xl_arr = jnp.asarray(y_xl, dtype=jnp.float64).reshape(N + 1, nxl)
-        y_ul_arr = jnp.asarray(y_ul, dtype=jnp.float64).reshape(N, nul)
-        y_xc_arr = jnp.asarray(y_xc, dtype=jnp.float64).reshape(nq, N + 1, nxi)
-        y_uc_arr = jnp.asarray(y_uc, dtype=jnp.float64).reshape(nq, N, nui)
-
-        params_batch = {
-            'rho_lx': jnp.full((N + 1,), rho_lx),
-            'rho_lu': jnp.full((N + 1,), rho_lu),
-            'rho_ix': jnp.full((N + 1,), rho_ix),
-            'rho_iu': jnp.full((N + 1,), rho_iu),
-            'admm_iter': jnp.full((N + 1,), admm_iter),
-            'admm_total': jnp.full((N + 1,), float(self.max_iter_ADMM)),
-            'rl': jnp.full((N + 1,), self.rl),
-            'ro': jnp.full((N + 1,), self.ro),
-            'rq': jnp.full((N + 1,), self.rq),
-            'cl0': jnp.full((N + 1,), self.cl0),
-            'p_bar': jnp.full((N + 1,), self.p_bar),
-            'ml': jnp.full((N + 1,), self.ml),
-            'mq': jnp.full((N + 1,), self.mq),
-            'fmax': jnp.full((N + 1,), self.fmax),
-            't_min': jnp.full((N + 1,), self.t_min),
-            't_max': jnp.full((N + 1,), self.t_max),
-            'ui_bound': jnp.full((N + 1,), self.ui_bound),
-            'g': jnp.full((N + 1,), self.g),
-            'is_terminal': jnp.concatenate([jnp.zeros((N,)), jnp.ones((1,))], axis=0),
-            'eq_scale': jnp.full((N + 1,), 1e-1),
-            'ineq_scale': jnp.full((N + 1,), 1e-2),
-            'Pt': jnp.tile(self.Pt[None, ...], (N + 1, 1, 1)),
-            'ra': jnp.tile(self.ra[None, ...], (N + 1, 1, 1)),
-            'Jl': jnp.tile(self.Jl[None, ...], (N + 1, 1, 1)),
-            'Jl_inv': jnp.tile(self.Jl_inv[None, ...], (N + 1, 1, 1)),
-            'pob1': jnp.tile(self.pob1[None, ...], (N + 1, 1)),
-            'pob2': jnp.tile(self.pob2[None, ...], (N + 1, 1)),
-            'xl_ideal': xl_ideal_arr,
-            'ul_ideal': jnp.concatenate([ul_ideal_arr, jnp.zeros((1, nul), dtype=ul_ideal_arr.dtype)], axis=0),
-            'xc_ideal': xc_ideal_arr.transpose(1, 0, 2),
-            'uc_ideal': jnp.concatenate([uc_ideal_arr, jnp.zeros((nq, 1, nui), dtype=uc_ideal_arr.dtype)], axis=1).transpose(1, 0, 2),
-            'xl_ref': ref_xl,
-            'ul_ref': jnp.concatenate([ref_ul, jnp.zeros((1, nul), dtype=ref_ul.dtype)], axis=0),
-            'xc_ref': ref_xq_batch.transpose(1, 0, 2),
-            'uc_ref': jnp.tile(ref_uq_batch[None, :, :], (N + 1, 1, 1)),
-            'y_xl': y_xl_arr,
-            'y_ul': jnp.concatenate([y_ul_arr, jnp.zeros((1, nul), dtype=y_ul_arr.dtype)], axis=0),
-            'y_xc': y_xc_arr.transpose(1, 0, 2),
-            'y_uc': jnp.concatenate([y_uc_arr, jnp.zeros((nq, 1, nui), dtype=y_uc_arr.dtype)], axis=1).transpose(1, 0, 2),
-        }
-
-        cables_init = jnp.concatenate([params_batch['xc_ref'], params_batch['uc_ref']], axis=2)
-        w_init = jnp.concatenate(
-            [params_batch['xl_ref'], params_batch['ul_ref'], cables_init.reshape(N + 1, -1)],
-            axis=1,
-        )
-        return w_init, params_batch
-
-
-    def _prepare_subp2_batch(self, Para2):
-        """
-        [JAX 血管函数] 为并行 ipoptax 准备全时域 Batch 数据
-        """
-        prebuilt = Para2.get('_prebuilt_subp2_batch', None)
-        if prebuilt is not None:
-            return prebuilt
-        N, nq = self.N, int(self.nq)
-        nxl, nul, nxi, nui = self.nxl, self.nul, self.nxi, self.nui
-
-        # --- 1. 基础物理量提取与广播 ---
-        # 我们把这些静态常数复制 N+1 份，方便 vmap 同时读取
-        params_batch = {
-            'rho_lx': jnp.full((N+1,), Para2['rho_lx']),
-            'rho_lu': jnp.full((N+1,), Para2['rho_lu']),
-            'rho_ix': jnp.full((N+1,), Para2['rho_ix']),
-            'rho_iu': jnp.full((N+1,), Para2['rho_iu']),
-            'admm_iter': jnp.full((N+1,), Para2.get('admm_iter', 0.0)),
-            'admm_total': jnp.full((N+1,), Para2.get('admm_total', float(self.max_iter_ADMM))),
-            'rl':    jnp.full((N+1,), self.rl),
-            'ro':    jnp.full((N+1,), self.ro),
-            'rq':    jnp.full((N+1,), self.rq),
-            'cl0':   jnp.full((N+1,), self.cl0),
-            'p_bar': jnp.full((N+1,), self.p_bar),
-            'ml':    jnp.full((N+1,), self.ml),
-            'mq':    jnp.full((N+1,), self.mq),
-            'fmax':  jnp.full((N+1,), self.fmax),
-            't_min': jnp.full((N+1,), self.t_min),
-            't_max': jnp.full((N+1,), self.t_max),
-            'ui_bound': jnp.full((N+1,), self.ui_bound),
-            'g':     jnp.full((N+1,), self.g),
-            'is_terminal': jnp.concatenate([jnp.zeros((N,)), jnp.ones((1,))], axis=0),
-            'eq_scale': jnp.full((N+1,), 1e-1),
-            'ineq_scale': jnp.full((N+1,), 1e-2),
-
-            # 广播 2D/3D 矩阵
-            'Pt':    jnp.tile(self.Pt[None, ...], (N+1, 1, 1)),
-            'ra':    jnp.tile(self.ra[None, ...], (N+1, 1, 1)),
-            'Jl':    jnp.tile(self.Jl[None, ...], (N+1, 1, 1)),
-            'Jl_inv': jnp.tile(self.Jl_inv[None, ...], (N+1, 1, 1)),
-            'pob1':  jnp.tile(self.pob1[None, ...], (N+1, 1)),
-            'pob2':  jnp.tile(self.pob2[None, ...], (N+1, 1)),
-
-            # 提取 DDP 算出的理想值 (作为引导)
-            'xl_ideal': jnp.array(Para2['xl_ideal']), # (N+1, 13)
-            # 控制量补齐第 N+1 个点
-            'ul_ideal': jnp.concatenate([jnp.array(Para2['ul_ideal']), jnp.zeros((1, nul))], axis=0), # (N+1, 6)
-            # 缆绳部分：必须转置，确保时间维在第一位
-            'xc_ideal': jnp.array(Para2['xc_ideal']).transpose(1, 0, 2), # (N+1, nq, nxi)
-            'uc_ideal': jnp.concatenate([jnp.array(Para2['uc_ideal']), jnp.zeros((nq, 1, nui))], axis=1).transpose(1, 0, 2), # (N+1, nq, 4)
-
-            # 对齐原版 IPOPT：SubP2 的 x0 使用参考轨迹
-            'xl_ref': jnp.array(Para2['xl_ref']), # (N+1, nxl)
-            'ul_ref': jnp.concatenate([jnp.array(Para2['ul_ref']), jnp.zeros((1, nul))], axis=0), # (N+1, nul)
-            'xc_ref': jnp.array(Para2['xc_ref']).transpose(1, 0, 2), # (N+1, nq, nxi)
-            'uc_ref': jnp.tile(jnp.array(Para2['uc_ref_single'])[None, :, :], (N + 1, 1, 1)), # (N+1, nq, nui)
-
-            # 提取当前的对偶变量
-            'y_xl': jnp.array(Para2['y_xl']), # (N+1, 13)
-            'y_ul': jnp.concatenate([jnp.array(Para2['y_ul']), jnp.zeros((1, nul))], axis=0), # (N+1, 6)
-            'y_xc': jnp.array(Para2['y_xc']).transpose(1, 0, 2), # (N+1, nq, nxi)
-            'y_uc': jnp.concatenate([jnp.array(Para2['y_uc']), jnp.zeros((nq, 1, nui))], axis=1).transpose(1, 0, 2)  # (N+1, nq, 4)
-        }
-
-        # --- 2. 构造 w_init (每一行代表一个时刻的初始猜想) ---
-
-        # (A) 负载状态与控制（reference-based init，与原版对齐）
-        xl_init = params_batch['xl_ref']
-        ul_init = params_batch['ul_ref']
-
-        # (B)(C) 缆绳状态+控制需要按每架无人机交错拼接，才能匹配 _ipoptax_unpack:
-        # rem = w[nxl+nul:].reshape(nq, nxi+nui) -> [xi_1, ui_1, xi_2, ui_2, ...]
-        cables_init = jnp.concatenate(
-            [params_batch['xc_ref'], params_batch['uc_ref']], axis=2
-        )  # (N+1, nq, nxi+nui)
-        cables_init_flat = cables_init.reshape(N + 1, -1)
-
-        # (D) 终极拼接：[负载状态, 负载控制, 逐机交错后的缆绳变量]
-        w_init = jnp.concatenate([xl_init, ul_init, cables_init_flat], axis=1)
-
-        return w_init, params_batch
-
-
-    def jax_ADMM_forward_MPC(self, Ref_xl, Ref_ul, ref_xq, ref_uq, xl_fb, xq_fb, paral, parac, max_iter_ADMM):
-        """
-        [JAX 全并行版] ADMM 前向规划主流程
-        """
-        verbose = bool(getattr(self, "verbose", False))
-        def finite_str(arr):
-            a = np.asarray(arr)
-            n_fin = int(np.isfinite(a).sum())
-            return f"{n_fin}/{a.size}"
-
-        self.max_iter_ADMM = max_iter_ADMM
-        t_all = TM.time()
-        profile = {
-            "init_ms": 0.0,
-            "total_ms": 0.0,
-            "iters": [],
-        }
-        if verbose:
-            print(f"[JAX-ADMM] start: horizon={self.N}, admm_iters={max_iter_ADMM}", flush=True)
-            cable_mode = os.environ.get("JAX_CABLE_SUBP1_MODE", "batched").lower()
-            print(f"[JAX-ADMM] cable_subp1_mode={cable_mode}", flush=True)
-
-        # --- 1. 轨迹初始化 ---
-        t_init = TM.time()
-        scxl_traj, scul_traj, scxc_traj, scuc_traj = self._initialize_trajectories(Ref_xl, Ref_ul, ref_xq, ref_uq)
-        y_xl, y_ul = jnp.zeros_like(scxl_traj), jnp.zeros_like(scul_traj)
-        y_xc, y_uc = jnp.zeros_like(scxc_traj), jnp.zeros_like(scuc_traj)
-        profile["init_ms"] = (TM.time() - t_init) * 1000.0
-        if verbose:
-            print(
-                f"[JAX-ADMM] init done in {profile['init_ms']:.2f} ms | "
-                f"scxl finite={finite_str(scxl_traj)} scxc finite={finite_str(scxc_traj)}",
-                flush=True,
-            )
-
-        # --- 2. ADMM 迭代大循环 ---
-        subp2_diag_history = []
-        for i_admm in range(max_iter_ADMM):
-            t_iter = TM.time()
-            iter_profile = {
-                "admm_iter": int(i_admm),
-                "subp1_ms": 0.0,
-                "subp2_ms": 0.0,
-                "subp3_ms": 0.0,
-                "iter_total_ms": 0.0,
-            }
-            if verbose:
-                print(f"[JAX-ADMM] iter {i_admm+1}/{max_iter_ADMM} start", flush=True)
-
-            # --- (A) 子问题 1：并行 DDP 规划 ---
-            t_sp1 = TM.time()
-            subp1_fast_mode = os.environ.get("JAX_SUBP1_FORWARD_ONLY_FAST_PATH", "direct").lower()
-            cable_mode = os.environ.get("JAX_CABLE_SUBP1_MODE", "batched").lower()
-            if subp1_fast_mode in ("1", "true", "direct") and cable_mode == "batched":
-                xl_opt, ul_opt = self._solve_load_subp1_forward_only(
-                    xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm, return_host=True
-                )
-                xc_opt, uc_opt = self._solve_cable_subp1_forward_only(
-                    xq_fb, ref_xq, ref_uq, parac, scxc_traj, scuc_traj, y_xc, y_uc, i_admm, return_host=True
-                )
-                xl_opt = jnp.asarray(xl_opt, dtype=jnp.float64)
-                ul_opt = jnp.asarray(ul_opt, dtype=jnp.float64)
-                xc_opt = jnp.asarray(xc_opt, dtype=jnp.float64)
-                uc_opt = jnp.asarray(uc_opt, dtype=jnp.float64)
-            elif subp1_fast_mode == "packaged" and cable_mode == "batched":
-                ParaL = self._pack_paraL(xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm)
-                ParaC = self._pack_paraC(xq_fb, ref_xq, ref_uq, parac, scxc_traj, scuc_traj, y_xc, y_uc, i_admm)
-
-                sol1_load, _ = self.jax_MPC_Load_DDP_Planning_SubP1(ParaL, need_derivs=False)
-                sol1_cable, _ = self.jax_MPC_Cable_DDP_Planning_SubP1(ParaC, need_derivs=False)
-
-                xl_opt = sol1_load['xl_traj'][0]
-                ul_opt = sol1_load['ul_traj'][0]
-                xc_opt = jnp.array(sol1_cable['xc_traj']) # (nq, N+1, nxi)
-                uc_opt = jnp.array(sol1_cable['uc_traj']) # (nq, N, 4)
-            else:
-                ParaL = self._pack_paraL(xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm)
-                ParaC = self._pack_paraC(xq_fb, ref_xq, ref_uq, parac, scxc_traj, scuc_traj, y_xc, y_uc, i_admm)
-
-                sol1_load, _ = self.jax_MPC_Load_DDP_Planning_SubP1(ParaL)
-                sol1_cable, _ = self.jax_MPC_Cable_DDP_Planning_SubP1(ParaC)
-
-                xl_opt = sol1_load['xl_traj'][0]
-                ul_opt = sol1_load['ul_traj'][0]
-                xc_opt = jnp.array(sol1_cable['xc_traj']) # (nq, N+1, nxi)
-                uc_opt = jnp.array(sol1_cable['uc_traj']) # (nq, N, 4)
-            iter_profile["subp1_ms"] = (TM.time() - t_sp1) * 1000.0
-            if verbose:
-                print(
-                    f"[JAX-ADMM] iter {i_admm+1} subp1 done in {iter_profile['subp1_ms']:.2f} ms | "
-                    f"xl={finite_str(xl_opt)} xc={finite_str(xc_opt)}",
-                    flush=True,
-                )
-
-            # --- (B) 子问题 2：并行一致性投影 (ipoptax) ---
-            t_sp2 = TM.time()
-            Para2 = self._pack_para2(
-                xl_opt, ul_opt, xc_opt, uc_opt,
-                Ref_xl, Ref_ul, ref_xq, ref_uq,
-                y_xl, y_ul, y_xc, y_uc, paral, parac, i_admm
-            )
-            sol2 = self.jax_ADMM_SubP2(Para2)
-            subp2_diag_history.append(sol2.get('diag', {}))
-
-            scxl_cons = sol2['scxl_traj']
-            scul_cons = sol2['scul_traj']
-            scxc_cons = jnp.array(sol2['scxc_traj'])
-            scuc_cons = jnp.array(sol2['scuc_traj'])
-            iter_profile["subp2_ms"] = (TM.time() - t_sp2) * 1000.0
-            if verbose:
-                print(
-                    f"[JAX-ADMM] iter {i_admm+1} subp2 done in {iter_profile['subp2_ms']:.2f} ms | "
-                    f"scxl={finite_str(scxl_cons)} scxc={finite_str(scxc_cons)}",
-                    flush=True,
-                )
-
-            # --- (C) 子问题 3：对偶变量更新 ---
-            # 调用我们之前改好的 JAX 版 SubP3
-            t_sp3 = TM.time()
-            sol3 = self.jax_ADMM_SubP3(
-                xl_opt, scxl_cons, y_xl, ul_opt, scul_cons, y_ul,
-                xc_opt, scxc_cons, y_xc, uc_opt, scuc_cons, y_uc,
-                paral[-4], paral[-3], paral[-2], paral[-1],
-                parac[-4], parac[-3], parac[-2], parac[-1],
-                max_iter_ADMM, i_admm
-            )
-
-            # 更新对偶变量，存入下一轮
-            y_xl, y_ul = sol3['scxL_traj_new'], sol3['scuL_traj_new']
-            y_xc, y_uc = sol3['scxC_traj_new'], sol3['scuC_traj_new']
-
-            # 同时更新 SubP2 用的共识变量
-            scxl_traj, scul_traj = scxl_cons, scul_cons
-            scxc_traj, scuc_traj = scxc_cons, scuc_cons
-            iter_profile["subp3_ms"] = (TM.time() - t_sp3) * 1000.0
-            iter_profile["iter_total_ms"] = (TM.time() - t_iter) * 1000.0
-            profile["iters"].append(iter_profile)
-            if verbose:
-                print(
-                    f"[JAX-ADMM] iter {i_admm+1} subp3 done in {iter_profile['subp3_ms']:.2f} ms | "
-                    f"y_xl={finite_str(y_xl)} y_xc={finite_str(y_xc)}",
-                    flush=True,
-                )
-                print(
-                    f"[JAX-ADMM] iter {i_admm+1} total {iter_profile['iter_total_ms']:.2f} ms",
-                    flush=True,
-                )
-
-            # --- (D) 收敛性检查 ---
-            # ...
-
-        profile["total_ms"] = (TM.time() - t_all) * 1000.0
-        if verbose:
-            print(f"[JAX-ADMM] finished in {profile['total_ms'] / 1000.0:.2f} s", flush=True)
-
-        return {
-            'load_trajectory': xl_opt,
-            'cable_trajectories': xc_opt,
-            'control_inputs': ul_opt,
-            'subp2_diag_history': subp2_diag_history,
-            'profile': profile,
-        }
-
-    def _initialize_trajectories(self, Ref_xl, Ref_ul, ref_xq, ref_uq):
-        """
-        [JAX 移植版] 轨迹初始化逻辑 (严格对应原版 L1624-L1650)
-        """
-        N, nq = self.N, self.nq
-        params = self._get_static_params()
-
-        # 原版 ADMM_forward_MPC 的 safe-copy 初始化并不是整条 rollout：
-        # 每个时刻都从该切片当前值（初始全零）做一次单步动力学，terminal 保持为零。
-        # 这里故意保留这个“坏初值”行为，先确保 forward 逻辑一致。
-        ref_ul_seq = jnp.asarray(Ref_ul).reshape(N, self.nul)
-        scxl_traj = self._init_load_traj_jit(ref_ul_seq, params, self.nxl)
-        scul_traj = ref_ul_seq
-
-        # 缆绳侧同理：每个时刻从零状态单独推进一步，terminal 保持为零。
-        ref_uq_mat = jnp.asarray(ref_uq).reshape(nq, self.nui)
-        scxc_traj, scuc_traj = self._init_cable_traj_jit(
-            ref_uq_mat,
-            params,
-            self.nxi,
-            N,
-        )
-
-        return scxl_traj, scul_traj, scxc_traj, scuc_traj
-
-    def _get_static_params(self):
-        """[JAX 血管函数] 返回 JAX 算子需要的静态物理字典"""
-        cached = getattr(self, "_static_params_cache", None)
-        if cached is None:
-            cached = {
-                'ml': float(self.ml),
-                'dt': float(self.dt),
-                'Jl': jnp.array(self.Jl, dtype=jnp.float64),
-                'Jl_inv': jnp.array(self.Jl_inv, dtype=jnp.float64),
-                'g': 9.81,
-                'ez': jnp.array([0.0, 0.0, 1.0], dtype=jnp.float64)
-            }
-            self._static_params_cache = cached
-        return cached
-
-    def _pack_paraL(self, xl_fb, Ref_xl, Ref_ul, paral, scxl_traj, scul_traj, y_xl, y_ul, i_admm):
-        # 负载只有一个，所以返回一个只包含一个元素的列表
-        # 顺序严格遵守原版审计结果：初值, 参考x, 参考u, 共识x, 对偶x, 共识u, 对偶u, 权重, 迭代步
-        paral_arr = np.concatenate((
-            xl_fb.flatten(),
-            Ref_xl.flatten(),
-            Ref_ul.flatten(),
-            scxl_traj.flatten(),
-            y_xl.flatten(),
-            scul_traj.flatten(),
-            y_ul.flatten(),
-            paral.flatten(),
-            [float(i_admm)]
-        ))
-        return [paral_arr] # 返回列表以适配 B=1 的 Batch 模式
-
-    def _pack_paraC(self, xq_fb, ref_xq, ref_uq, paraC, scxc_traj, scuc_traj, y_xc, y_uc, i_admm):
-        ParaC_list = []
-        for i in range(self.nq):
-            # 这里的切片必须非常精准
-            parai = np.concatenate((
-                xq_fb[i*self.nxi : (i+1)*self.nxi], # 初值
-                ref_xq[i].flatten(),                # 参考状态轨迹
-                ref_uq[i*self.nui : (i+1)*self.nui], # 线缆参考控制 (单步)
-                scxc_traj[i].flatten(),             # 共识状态
-                y_xc[i].flatten(),                  # 状态对偶
-                scuc_traj[i].flatten(),             # 共识控制
-                y_uc[i].flatten(),                  # 控制对偶
-                paraC.flatten(),                    # 缆绳超参数
-                [float(i_admm)]                     # 迭代步数
-            ))
-            ParaC_list.append(parai)
-        return ParaC_list
-
-    def _pack_para2(self, xl_opt, ul_opt, xc_opt, uc_opt,
-                    Ref_xl, Ref_ul, ref_xq, ref_uq,
-                    y_xl, y_ul, y_xc, y_uc, paral, paraC, i_admm):
-        # 子问题 2 需要的是一个字典，里面存着全时域的张量
-        # 这样在 ADMM_SubP2 内部可以用 vmap 轻松拆解
-        xl_ref_mat = np.array(Ref_xl).reshape(self.N + 1, self.nxl)
-        ul_ref_mat = np.array(Ref_ul).reshape(self.N, self.nul)
-        xc_ref = np.array([np.array(ref_xq[i]).reshape(self.N + 1, self.nxi) for i in range(self.nq)])
-        uc_ref_single = np.array(ref_uq).reshape(self.nq, self.nui)
-        rho_lx = self.open_loop_penalty_jax(paral[-4], paral[-2], i_admm, self.max_iter_ADMM)
-        rho_lu = self.open_loop_penalty_jax(paral[-3], paral[-1], i_admm, self.max_iter_ADMM)
-        rho_ix = self.open_loop_penalty_jax(paraC[-4], paraC[-2], i_admm, self.max_iter_ADMM)
-        rho_iu = self.open_loop_penalty_jax(paraC[-3], paraC[-1], i_admm, self.max_iter_ADMM)
-        prebuilt_batch = self._build_subp2_batch_from_components(
-            xl_opt, ul_opt, xc_opt, uc_opt,
-            Ref_xl, Ref_ul, ref_xq, ref_uq,
-            y_xl, y_ul, y_xc, y_uc,
-            rho_lx, rho_lu, rho_ix, rho_iu,
-            float(i_admm),
-        )
-        return {
-            'xl_ideal': xl_opt,  # (N+1, 13)
-            'ul_ideal': ul_opt,  # (N, 6)
-            'xc_ideal': xc_opt,  # (nq, N+1, nxi)
-            'uc_ideal': uc_opt,  # (nq, N, 4)
-            'xl_ref': xl_ref_mat,          # (N+1, nxl)
-            'ul_ref': ul_ref_mat,          # (N, nul)
-            'xc_ref': xc_ref,              # (nq, N+1, nxi)
-            'uc_ref_single': uc_ref_single,  # (nq, nui)
-            'y_xl': y_xl,
-            'y_ul': y_ul,
-            'y_xc': y_xc,
-            'y_uc': y_uc,
-            'rho_lx': rho_lx,
-            'rho_lu': rho_lu,
-            'rho_ix': rho_ix,
-            'rho_iu': rho_iu,
-            'admm_iter': float(i_admm),
-            'admm_total': float(self.max_iter_ADMM),
-            'pob1': self.pob1,
-            'pob2': self.pob2,
-            '_prebuilt_subp2_batch': prebuilt_batch,
-        }
-
-
-    @staticmethod
-    def jax_subp3_update(xl_opt, scxl_cons, y_xl_old, rho_lx, ul_opt, scul_cons, y_ul_old, rho_lu):
-        """
-        [JAX 版] 负载对偶变量更新
-        """
-        # 对偶变量更新公式：y_new = y_old + rho * (primal - consensus)
-        y_xl_new = y_xl_old + rho_lx * (xl_opt - scxl_cons)
-        y_ul_new = y_ul_old + rho_lu * (ul_opt - scul_cons)
-        return y_xl_new, y_ul_new
-
-    @staticmethod
-    def jax_subp3_update_cable(xc_opt, scxc_cons, y_xc_old, rho_ix, uc_opt, scuc_cons, y_uc_old, rho_iu):
-        """
-        [JAX 版] 缆绳对偶变量并行更新 (利用 JAX 的自动广播机制)
-        """
-        y_xc_new = y_xc_old + rho_ix * (xc_opt - scxc_cons)
-        y_uc_new = y_uc_old + rho_iu * (uc_opt - scuc_cons)
-        return y_xc_new, y_uc_new
-
-    def jax_ADMM_SubP3(self, xl_traj, scxl_traj, scxL_traj, ul_traj, scul_traj, scuL_traj,
-                  xc_traj, scxc_traj, scxC_traj, uc_traj, scuc_traj, scuC_traj,
-                  px, pu, gammax, gammau, pix, piu, gammaix, gammaiu, ADMM_max, i_admm):
-        """
-        子问题 3 的类成员包装器
-        """
-        # 1. 计算当前步的动态惩罚系数
-        rho_lx = self.open_loop_penalty_jax(px, gammax, i_admm, ADMM_max)
-        rho_lu = self.open_loop_penalty_jax(pu, gammau, i_admm, ADMM_max)
-
-        # 2. 调用 JAX 纯函数更新负载对偶变量
-        y_xl_new, y_ul_new = self.jax_subp3_update(
-            xl_traj, scxl_traj, scxL_traj, rho_lx,
-            ul_traj, scul_traj, scuL_traj, rho_lu
-        )
-
-        # 3. 计算缆绳的动态惩罚 (对每一个无人机)
-        # 假设所有无人机共享这套参数，JAX 会处理广播
-        rho_ix = self.open_loop_penalty_jax(pix, gammaix, i_admm, ADMM_max)
-        rho_iu = self.open_loop_penalty_jax(piu, gammaiu, i_admm, ADMM_max)
-
-        # 4. 调用 JAX 纯函数更新缆绳对偶变量
-        y_xc_new, y_uc_new = self.jax_subp3_update_cable(
-            xc_traj, scxc_traj, scxC_traj, rho_ix,
-            uc_traj, scuc_traj, scuC_traj, rho_iu
-        )
-
-        return {
-            'scxL_traj_new': np.array(y_xl_new),
-            'scuL_traj_new': np.array(y_ul_new),
-            'scxC_traj_new': np.array(y_xc_new),
-            'scuC_traj_new': np.array(y_uc_new)
-        }
 
 
 
+    # ---------------------------------------------------------------------
+    # 以下开始大体进入"原版 CasADi / 旧 ADMM / 梯度训练"保留区。
+    # 对当前稳定 persistent Julia benchmark 主线来说，这一大块基本都可先跳过。
+    # 之所以还留在这个文件里，是因为历史实验、对照实现和训练代码还依赖它们。
+    # ---------------------------------------------------------------------
     def Rotational_Inertia(self,rp):  # TODO: Deprecated Type 1
         # rp=(x,y,0), a column vector, is the coordinate of the point-mass added on the uniform circular plate in its body frame 
         ratio_m    = self.m1*self.m2/self.ml
@@ -3478,16 +3363,6 @@ class MPC_Planner:
         rho_a = self.p_min + (rho - self.p_min) * 1/(1+exp(-gamma*(a - (ADMM_max-1)/2)))
         return rho_a
     
-    @staticmethod
-    def open_loop_penalty_jax(rho, gamma, a, ADMM_max):
-        """
-        [UseThis 版特有] 随迭代次数 a 变化的动态惩罚系数
-        rho: 最终权重, gamma: 陡峭度, a: 当前迭代步, ADMM_max: 总步数
-        """
-        # 这就是一个 Sigmoid 函数，让惩罚项随迭代步数逐渐从 0 增长到 rho
-        p_min = 1e-3
-        return p_min + (rho - p_min) * 1.0 / (1.0 + jnp.exp(-gamma * (a - (ADMM_max - 1) / 2.0)))
-
     def q_2_rotation(self, q):#TODO Type2 
          # from body frame to inertial frame
         # no normalization to avoid singularity in optimization
@@ -3498,17 +3373,6 @@ class MPC_Planner:
         horzcat(2 * q1 * q3 - 2 * q0 * q2, 2 * q0 * q1 + 2 * q2 * q3, 2 * (q0 ** 2 + q3 ** 2) - 1)
         )
         return R
-    
-    @staticmethod
-    def _q_2_rotation_jax(q):
-        """新增的 jax 版本的四元数转旋转矩阵 无归一化版本以保持导数平滑"""
-        # 纯函数：给定相同的输入，永远返回相同的输出，且没有副作用。
-        q0, q1, q2, q3 = q[0], q[1], q[2], q[3]
-        return jnp.array([
-            [2*(q0**2 + q1**2)-1, 2*(q1*q2 - q0*q3), 2*(q1*q3 + q0*q2)],
-            [2*(q1*q2 + q0*q3), 2*(q0**2 + q2**2)-1, 2*(q2*q3 - q0*q1)],
-            [2*(q1*q3 - q0*q2), 2*(q2*q3 + q0*q1), 2*(q0**2 + q3**2)-1]
-        ])
     
     def vee_map(self, v):
         vect = vertcat(v[2, 1], v[0, 2], v[1, 0])
@@ -5975,6 +5839,8 @@ class MPC_Planner:
     
     
 
+# 这个类主要服务离线梯度/超参数训练与论文相关实验，
+# 不属于当前稳定运行时 benchmark 主线。只关心 forward planner / Julia SubP2 的话可先跳过。
 class Gradient_Solver:
     def __init__(self, sysm_para, horizon, xl, ul, scxl, scul, xi, ui, scxi, scui, P_auto, weight1, weight2):
         """
@@ -6409,3 +6275,353 @@ class Gradient_Solver:
 
 
     
+
+# -----------------------------------------------------------------------------
+# 以下是下沉到文件底部的"非当前稳定主线"顶层 helper / cache。
+# - 旧 packaged SubP1 导数提取链会用到 load/cable derivs JIT cache
+# - 纯 JAX SubP2 barrier 实验分支会用到 barrier runtime cache
+# 它们都不是当前 persistent Julia 主线默认热路径。
+# -----------------------------------------------------------------------------
+
+_GLOBAL_SUBP2_BARRIER_RUNTIME_COMMON_CACHE = {}
+_GLOBAL_SUBP2_BARRIER_RUNTIME_STAGE_CACHE = {}
+_GLOBAL_LOAD_DERIVS_JIT = None
+_GLOBAL_CABLE_DERIVS_JIT = None
+
+
+def _get_global_load_derivs_jit():
+    # 仅在旧 SubP1 packaged 路径或显式 need_derivs=True 时才会真正用到。
+    # 当前稳定主线默认走 forward-only fast path，不会把这条导数提取链放进热路径。
+    global _GLOBAL_LOAD_DERIVS_JIT
+    if _GLOBAL_LOAD_DERIVS_JIT is None:
+        _GLOBAL_LOAD_DERIVS_JIT = jax.jit(MPC_Planner._static_load_derivs)
+    return _GLOBAL_LOAD_DERIVS_JIT
+
+
+def _get_global_cable_derivs_jit():
+    # 同上：这是 SubP1 导数导出核的全局 JIT 缓存，不是当前稳定主线默认会走到的计算。
+    global _GLOBAL_CABLE_DERIVS_JIT
+    if _GLOBAL_CABLE_DERIVS_JIT is None:
+        _GLOBAL_CABLE_DERIVS_JIT = jax.jit(MPC_Planner._static_cable_derivs)
+    return _GLOBAL_CABLE_DERIVS_JIT
+
+
+# -----------------------------------------------------------------------------
+# 以下是下沉到文件底部的"非当前稳定主线"顶层 helper。
+# 它们只服务纯 JAX SubP2 实验分支，当前 persistent Julia 主线默认不直接走。
+# -----------------------------------------------------------------------------
+
+def _subp2_filter_accept_batch(init_metrics, cand_metrics, filter_gamma_theta, filter_gamma_phi, accept_abs, accept_ratio):
+    theta_ok = cand_metrics["theta"] <= (1.0 - filter_gamma_theta) * init_metrics["theta"]
+    barr_ok = cand_metrics["barr"] <= init_metrics["barr"] - filter_gamma_phi * init_metrics["theta"]
+    feas_ok = cand_metrics["feas"] <= jnp.maximum(accept_abs, accept_ratio * init_metrics["feas"])
+    return jnp.logical_or(theta_ok, jnp.logical_or(barr_ok, feas_ok))
+
+
+def _subp2_tail_soft_mask(tail, metrics, finite_mask, soft_mu_tol, soft_comp_tol, soft_dual_tol, soft_trace_ineq_tol, soft_eq_tol, soft_raw_ineq_tol):
+    return jnp.logical_and(
+        finite_mask,
+        jnp.logical_and(
+            tail["mu"] <= soft_mu_tol,
+            jnp.logical_and(
+                tail["comp"] <= soft_comp_tol,
+                jnp.logical_and(
+                    tail["dual"] <= soft_dual_tol,
+                    jnp.logical_and(
+                        tail["ineq"] <= soft_trace_ineq_tol,
+                        jnp.logical_and(
+                            metrics["eq_inf"] <= soft_eq_tol,
+                            metrics["ineq_vio"] <= soft_raw_ineq_tol,
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+# 这个 kernel 只服务"纯 JAX ipoptax SubP2"分支，用来在 main / retry1 / retry2 结果里做快速筛选。
+# 当前稳定的 persistent Julia 主线不会走到这里，可先跳过。
+@jax.jit
+def _subp2_fast_select_kernel(
+    w_init_batch,
+    main_x,
+    main_conv,
+    main_iters,
+    init_metrics,
+    main_metrics,
+    main_tail,
+    retry1_x,
+    retry1_finite,
+    retry1_conv,
+    retry1_iters,
+    retry1_metrics,
+    retry1_tail,
+    retry2_x,
+    retry2_finite,
+    retry2_conv,
+    retry2_iters,
+    retry2_metrics,
+    retry2_tail,
+    retry_on_nonconv,
+    enable_retry2,
+    retry_trigger_ratio,
+    restoration_theta_ratio,
+    filter_gamma_theta,
+    filter_gamma_phi,
+    accept_abs,
+    accept_ratio,
+    soft_mu_tol,
+    soft_comp_tol,
+    soft_dual_tol,
+    soft_eq_tol,
+    soft_raw_ineq_tol,
+    soft_trace_ineq_tol,
+    mode_code_main,
+    mode_code_main_soft,
+    mode_code_bestfeas,
+    mode_code_fallback,
+    mode_code_retry1,
+    mode_code_retry1_soft,
+    mode_code_retry1_bestfeas,
+    mode_code_retry2,
+    mode_code_retry2_soft,
+    mode_code_retry2_bestfeas,
+):
+    finite_mask = jnp.all(jnp.isfinite(main_x), axis=1)
+    soft_mask = _subp2_tail_soft_mask(
+        main_tail,
+        main_metrics,
+        finite_mask,
+        soft_mu_tol,
+        soft_comp_tol,
+        soft_dual_tol,
+        soft_trace_ineq_tol,
+        soft_eq_tol,
+        soft_raw_ineq_tol,
+    )
+    conv_mask = jnp.logical_and(finite_mask, jnp.logical_or(main_conv, soft_mask))
+    filter_ok = jnp.logical_and(
+        finite_mask,
+        _subp2_filter_accept_batch(
+            init_metrics,
+            main_metrics,
+            filter_gamma_theta,
+            filter_gamma_phi,
+            accept_abs,
+            accept_ratio,
+        ),
+    )
+    resto_ok = jnp.logical_and(
+        finite_mask,
+        main_metrics["theta"] <= restoration_theta_ratio * init_metrics["theta"],
+    )
+    improved = jnp.logical_and(
+        finite_mask,
+        main_metrics["feas"] < (init_metrics["feas"] - 1e-6),
+    )
+    main_bestfeas_mask = jnp.logical_and(
+        jnp.logical_not(conv_mask),
+        jnp.logical_or(filter_ok, jnp.logical_and(improved, resto_ok)),
+    )
+
+    candidate_x = jnp.where(finite_mask[:, None], main_x, w_init_batch)
+    candidate_metrics = {
+        "eq_inf": jnp.where(finite_mask, main_metrics["eq_inf"], init_metrics["eq_inf"]),
+        "ineq_vio": jnp.where(finite_mask, main_metrics["ineq_vio"], init_metrics["ineq_vio"]),
+        "feas": jnp.where(finite_mask, main_metrics["feas"], jnp.inf),
+        "theta": jnp.where(finite_mask, main_metrics["theta"], jnp.inf),
+        "barr": jnp.where(finite_mask, main_metrics["barr"], jnp.inf),
+    }
+    candidate_tail = {
+        "mu": jnp.where(finite_mask, main_tail["mu"], jnp.nan),
+        "ineq": jnp.where(finite_mask, main_tail["ineq"], jnp.nan),
+        "comp": jnp.where(finite_mask, main_tail["comp"], jnp.nan),
+        "dual": jnp.where(finite_mask, main_tail["dual"], jnp.nan),
+    }
+    accepted_conv_mask = conv_mask
+    diag_iters = main_iters
+    diag_mode_codes = jnp.where(
+        main_conv,
+        mode_code_main,
+        jnp.where(
+            soft_mask,
+            mode_code_main_soft,
+            jnp.where(main_bestfeas_mask, mode_code_bestfeas, mode_code_fallback),
+        ),
+    )
+
+    need_retry_mask = jnp.logical_or(
+        jnp.logical_not(finite_mask),
+        jnp.logical_and(
+            jnp.logical_and(retry_on_nonconv, jnp.logical_not(conv_mask)),
+            main_metrics["feas"] >= retry_trigger_ratio * init_metrics["feas"],
+        ),
+    )
+
+    def _apply_candidate_update(
+        success_mask,
+        better_mask,
+        x_new,
+        metrics_new,
+        tail_new,
+        iters_new,
+        mode_success_code,
+        mode_soft_code,
+        mode_better_code,
+        soft_success_mask,
+        conv_success_mask,
+        candidate_x,
+        candidate_metrics,
+        candidate_tail,
+        accepted_conv_mask,
+        diag_iters,
+        diag_mode_codes,
+    ):
+        update_mask = jnp.logical_or(success_mask, better_mask)
+        candidate_x = jnp.where(update_mask[:, None], x_new, candidate_x)
+        candidate_metrics = {
+            "eq_inf": jnp.where(update_mask, metrics_new["eq_inf"], candidate_metrics["eq_inf"]),
+            "ineq_vio": jnp.where(update_mask, metrics_new["ineq_vio"], candidate_metrics["ineq_vio"]),
+            "feas": jnp.where(update_mask, metrics_new["feas"], candidate_metrics["feas"]),
+            "theta": jnp.where(update_mask, metrics_new["theta"], candidate_metrics["theta"]),
+            "barr": jnp.where(update_mask, metrics_new["barr"], candidate_metrics["barr"]),
+        }
+        candidate_tail = {
+            "mu": jnp.where(update_mask, tail_new["mu"], candidate_tail["mu"]),
+            "ineq": jnp.where(update_mask, tail_new["ineq"], candidate_tail["ineq"]),
+            "comp": jnp.where(update_mask, tail_new["comp"], candidate_tail["comp"]),
+            "dual": jnp.where(update_mask, tail_new["dual"], candidate_tail["dual"]),
+        }
+        diag_iters = jnp.where(update_mask, iters_new, diag_iters)
+        diag_mode_codes = jnp.where(
+            success_mask,
+            jnp.where(jnp.logical_and(soft_success_mask, jnp.logical_not(conv_success_mask)), mode_soft_code, mode_success_code),
+            jnp.where(better_mask, mode_better_code, diag_mode_codes),
+        )
+        accepted_conv_mask = jnp.logical_or(accepted_conv_mask, success_mask)
+        return candidate_x, candidate_metrics, candidate_tail, accepted_conv_mask, diag_iters, diag_mode_codes
+
+    retry1_soft = _subp2_tail_soft_mask(
+        retry1_tail,
+        retry1_metrics,
+        retry1_finite,
+        soft_mu_tol,
+        soft_comp_tol,
+        soft_dual_tol,
+        soft_trace_ineq_tol,
+        soft_eq_tol,
+        soft_raw_ineq_tol,
+    )
+    retry1_success = jnp.logical_and(
+        need_retry_mask,
+        jnp.logical_and(retry1_finite, jnp.logical_or(retry1_conv, retry1_soft)),
+    )
+    retry1_better = jnp.logical_and(
+        need_retry_mask,
+        jnp.logical_and(retry1_finite, retry1_metrics["feas"] < candidate_metrics["feas"]),
+    )
+    candidate_x, candidate_metrics, candidate_tail, accepted_conv_mask, diag_iters, diag_mode_codes = _apply_candidate_update(
+        retry1_success,
+        retry1_better,
+        retry1_x,
+        retry1_metrics,
+        retry1_tail,
+        retry1_iters,
+        mode_code_retry1,
+        mode_code_retry1_soft,
+        mode_code_retry1_bestfeas,
+        retry1_soft,
+        retry1_conv,
+        candidate_x,
+        candidate_metrics,
+        candidate_tail,
+        accepted_conv_mask,
+        diag_iters,
+        diag_mode_codes,
+    )
+
+    retry2_needed = jnp.logical_and(enable_retry2, need_retry_mask)
+    retry2_soft = _subp2_tail_soft_mask(
+        retry2_tail,
+        retry2_metrics,
+        retry2_finite,
+        soft_mu_tol,
+        soft_comp_tol,
+        soft_dual_tol,
+        soft_trace_ineq_tol,
+        soft_eq_tol,
+        soft_raw_ineq_tol,
+    )
+    retry2_success = jnp.logical_and(
+        retry2_needed,
+        jnp.logical_and(retry2_finite, jnp.logical_or(retry2_conv, retry2_soft)),
+    )
+    retry2_better = jnp.logical_and(
+        retry2_needed,
+        jnp.logical_and(retry2_finite, retry2_metrics["feas"] < candidate_metrics["feas"]),
+    )
+    candidate_x, candidate_metrics, candidate_tail, accepted_conv_mask, diag_iters, diag_mode_codes = _apply_candidate_update(
+        retry2_success,
+        retry2_better,
+        retry2_x,
+        retry2_metrics,
+        retry2_tail,
+        retry2_iters,
+        mode_code_retry2,
+        mode_code_retry2_soft,
+        mode_code_retry2_bestfeas,
+        retry2_soft,
+        retry2_conv,
+        candidate_x,
+        candidate_metrics,
+        candidate_tail,
+        accepted_conv_mask,
+        diag_iters,
+        diag_mode_codes,
+    )
+
+    candidate_valid = jnp.isfinite(candidate_metrics["feas"])
+    filter_ok_final = jnp.logical_and(
+        candidate_valid,
+        _subp2_filter_accept_batch(
+            init_metrics,
+            candidate_metrics,
+            filter_gamma_theta,
+            filter_gamma_phi,
+            accept_abs,
+            accept_ratio,
+        ),
+    )
+    resto_ok_final = jnp.logical_and(
+        candidate_valid,
+        candidate_metrics["theta"] <= restoration_theta_ratio * init_metrics["theta"],
+    )
+    improved_final = jnp.logical_and(
+        candidate_valid,
+        candidate_metrics["feas"] < (init_metrics["feas"] - 1e-6),
+    )
+    bestfeas_mask = jnp.logical_and(
+        jnp.logical_not(accepted_conv_mask),
+        jnp.logical_or(filter_ok_final, jnp.logical_and(improved_final, resto_ok_final)),
+    )
+    accept_mask = jnp.logical_or(accepted_conv_mask, bestfeas_mask)
+    diag_mode_codes = jnp.where(
+        jnp.logical_and(jnp.logical_not(accept_mask), jnp.logical_not(accepted_conv_mask)),
+        mode_code_fallback,
+        diag_mode_codes,
+    )
+
+    return {
+        "w_opt_batch": jnp.where(accept_mask[:, None], candidate_x, w_init_batch),
+        "accept_mask": accept_mask,
+        "accepted_conv_mask": accepted_conv_mask,
+        "diag_mode_codes": diag_mode_codes,
+        "diag_iters": jnp.where(accept_mask, diag_iters, 0),
+        "diag_eq_inf": jnp.where(accept_mask, candidate_metrics["eq_inf"], init_metrics["eq_inf"]),
+        "diag_ineq_vio": jnp.where(accept_mask, candidate_metrics["ineq_vio"], init_metrics["ineq_vio"]),
+        "diag_tail_mu": jnp.where(candidate_valid, candidate_tail["mu"], jnp.nan),
+        "diag_tail_ineq": jnp.where(candidate_valid, candidate_tail["ineq"], jnp.nan),
+        "diag_tail_comp": jnp.where(candidate_valid, candidate_tail["comp"], jnp.nan),
+        "diag_tail_dual": jnp.where(candidate_valid, candidate_tail["dual"], jnp.nan),
+    }

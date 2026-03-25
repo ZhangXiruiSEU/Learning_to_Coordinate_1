@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from typing import Callable, Tuple, Any, Dict
 
 import jax
-#01.10版本不匹配
-jax.config.update("jax_platform_name", "cpu")
 import jax.numpy as jnp
 from jax import jit, vmap, lax, tree_util
 from jax import remat as checkpoint
@@ -72,58 +70,73 @@ def _ilqr_unflatten(aux, children):
 
 tree_util.register_pytree_node(ILQRResult, _ilqr_flatten, _ilqr_unflatten)
 
+
+def _stage_params(params: Any, t: int) -> Any:
+    if isinstance(params, dict) and "stage" in params:
+        merged = dict(params.get("static", {}))
+        merged.update(jax.tree_util.tree_map(lambda a: a[t], params["stage"]))
+        return merged
+    return params
+
+
+def _terminal_params(params: Any) -> Any:
+    if isinstance(params, dict) and "terminal" in params:
+        merged = dict(params.get("static", {}))
+        merged.update(params["terminal"])
+        return merged
+    return params
+
 def symmetric_psd(A: Array, reg: float) -> Array:
     n = A.shape[-1]
     return A + reg * jnp.eye(n, dtype=A.dtype)
 
 def rollout(dynamics_fn: Callable[[Array, Array, Any], Array],
             x0: Array, us: Array, params: Any) -> Array:
-    def step(x, u):
-        x_next = dynamics_fn(x, u, params)
+    def step(x, inputs):
+        t, u = inputs
+        x_next = dynamics_fn(x, u, _stage_params(params, t))
         return x_next, x_next
-    xT, xs_tail = lax.scan(step, x0, us)
+    xT, xs_tail = lax.scan(step, x0, (jnp.arange(us.shape[0]), us))
     xs = jnp.concatenate([x0[None, :], xs_tail], axis=0)
     return xs
 
 def total_cost(cost_fn: Callable[[Array, Array, Any], Array],
                term_cost_fn: Callable[[Array, Any], Array],
                xs: Array, us: Array, params: Any) -> Array:
-    stage_costs = vmap(lambda x,u: cost_fn(x,u,params))(xs[:-1], us)
-    terminal = term_cost_fn(xs[-1], params)
+    def stage_cost_at(t, x, u):
+        return cost_fn(x, u, _stage_params(params, t))
+    stage_costs = vmap(stage_cost_at)(jnp.arange(us.shape[0]), xs[:-1], us)
+    terminal = term_cost_fn(xs[-1], _terminal_params(params))
     return jnp.sum(stage_costs) + terminal
 
 def derivatives(dynamics_fn, cost_fn, term_cost_fn, xs, us, params):
-    fx_fn = jit(jax.jacobian(lambda x,u,p: dynamics_fn(x,u,p), 0))
-    fu_fn = jit(jax.jacobian(lambda x,u,p: dynamics_fn(x,u,p), 1))
-    lx_fn = jit(jax.grad(lambda x,u,p: cost_fn(x,u,p), 0))
-    lu_fn = jit(jax.grad(lambda x,u,p: cost_fn(x,u,p), 1))
-    lxx_fn = jit(jax.hessian(lambda x,u,p: cost_fn(x,u,p), 0))
-    luu_fn = jit(jax.hessian(lambda x,u,p: cost_fn(x,u,p), 1))
-    lux_fn = jit(jax.jacobian(lambda x,u,p: jax.grad(cost_fn, 1)(x,u,p), 0))
-    Vx_T_fn = jit(jax.grad(lambda x,p: term_cost_fn(x,p), 0))
-    Vxx_T_fn = jit(jax.hessian(lambda x,p: term_cost_fn(x,p), 0))
+    fx_fn = jit(jax.jacobian(lambda x, u, p: dynamics_fn(x, u, p), 0))
+    fu_fn = jit(jax.jacobian(lambda x, u, p: dynamics_fn(x, u, p), 1))
+    lx_fn = jit(jax.grad(lambda x, u, p: cost_fn(x, u, p), 0))
+    lu_fn = jit(jax.grad(lambda x, u, p: cost_fn(x, u, p), 1))
+    lxx_fn = jit(jax.hessian(lambda x, u, p: cost_fn(x, u, p), 0))
+    luu_fn = jit(jax.hessian(lambda x, u, p: cost_fn(x, u, p), 1))
+    lux_fn = jit(jax.jacobian(lambda x, u, p: jax.grad(cost_fn, 1)(x, u, p), 0))
+    Vx_T_fn = jit(jax.grad(lambda x, p: term_cost_fn(x, p), 0))
+    Vxx_T_fn = jit(jax.hessian(lambda x, p: term_cost_fn(x, p), 0))
 
-    # fx = vmap(fx_fn)(xs[:-1], us, jax.tree_map(lambda a: a, params))
-    # fu = vmap(fu_fn)(xs[:-1], us, jax.tree_map(lambda a: a, params))
+    def deriv_step(t, x, u):
+        p_t = _stage_params(params, t)
+        return (
+            fx_fn(x, u, p_t),
+            fu_fn(x, u, p_t),
+            lx_fn(x, u, p_t),
+            lu_fn(x, u, p_t),
+            lxx_fn(x, u, p_t),
+            luu_fn(x, u, p_t),
+            lux_fn(x, u, p_t),
+        )
 
-    # lx  = vmap(lx_fn)(xs[:-1], us, params)
-    # lu  = vmap(lu_fn)(xs[:-1], us, params)
-    # lxx = vmap(lxx_fn)(xs[:-1], us, params)
-    # luu = vmap(luu_fn)(xs[:-1], us, params)
-    # lux = vmap(lux_fn)(xs[:-1], us, params)
+    fx, fu, lx, lu, lxx, luu, lux = vmap(deriv_step)(jnp.arange(us.shape[0]), xs[:-1], us)
 
-    fx = vmap(fx_fn, in_axes=(0, 0, None))(xs[:-1], us, params)
-    fu = vmap(fu_fn, in_axes=(0, 0, None))(xs[:-1], us, params)
-
-    lx  = vmap(lx_fn,  in_axes=(0, 0, None))(xs[:-1], us, params)
-    lu  = vmap(lu_fn,  in_axes=(0, 0, None))(xs[:-1], us, params)
-    lxx = vmap(lxx_fn, in_axes=(0, 0, None))(xs[:-1], us, params)
-    luu = vmap(luu_fn, in_axes=(0, 0, None))(xs[:-1], us, params)
-    lux = vmap(lux_fn, in_axes=(0, 0, None))(xs[:-1], us, params)
-
-
-    Vx_T  = Vx_T_fn(xs[-1], params)
-    Vxx_T = Vxx_T_fn(xs[-1], params)
+    p_T = _terminal_params(params)
+    Vx_T  = Vx_T_fn(xs[-1], p_T)
+    Vxx_T = Vxx_T_fn(xs[-1], p_T)
 
     return {"fx": fx, "fu": fu, "lx": lx, "lu": lu, "lxx": lxx, "luu": luu, "lux": lux,
             "Vx_T": Vx_T, "Vxx_T": Vxx_T}
@@ -151,13 +164,17 @@ def backward_pass(derivs, reg):
         Qxx = lxx_t + fx_t.T @ Vxx_next @ fx_t
         Quu = luu_t + fu_t.T @ Vxx_next @ fu_t
         Qux = lux_t + fu_t.T @ Vxx_next @ fx_t
+        Qxu = Qux.T
 
         Quu_reg = symmetric_psd(Quu, reg)
         k = -jnp.linalg.solve(Quu_reg, Qu)
         K = -jnp.linalg.solve(Quu_reg, Qux)
 
-        Vx = Qx + K.T @ Qu + Qux.T @ k + K.T @ Quu @ k
-        Vxx = Qxx + K.T @ Qux + Qux.T @ K + K.T @ Quu @ K
+        # 直接对齐 legacy DDP 的 Riccati 更新：
+        # Vx  = Qx + Qxu @ k_ff
+        # Vxx = sym(Qxx + Qxu @ K_fb)
+        Vx = Qx + Qxu @ k
+        Vxx = Qxx + Qxu @ K
         Vxx = 0.5 * (Vxx + Vxx.T)
 
         Qu_norm = jnp.linalg.norm(Qu)
@@ -171,16 +188,17 @@ def backward_pass(derivs, reg):
     Ks, ks, Qu_norms, conds = outs
     Ks = Ks[::-1]; ks = ks[::-1]
 
-    return Ks, ks, jnp.mean(Qu_norms), jnp.mean(conds)
+    return Ks, ks, jnp.max(Qu_norms), jnp.mean(conds)
 
 def forward_apply_policy(dynamics_fn, cost_fn, term_cost_fn,
                          x0, us_nominal, xs_nominal, Ks, ks, alpha, params):
     def step(x, t):
+        p_t = _stage_params(params, t)
         u_nom = us_nominal[t]
         x_nom = xs_nominal[t]
         K = Ks[t]; k = ks[t]
         u = u_nom + alpha * k + K @ (x - x_nom)
-        x_next = dynamics_fn(x, u, params)
+        x_next = dynamics_fn(x, u, p_t)
         return x_next, (x, u)
 
     xT, hist = lax.scan(step, x0, jnp.arange(us_nominal.shape[0]))
@@ -199,7 +217,7 @@ def ilqr_ddp_single(problem, dynamics_fn, cost_fn, term_cost_fn, cfg):
     
     # 1. 初始 Rollout
     xs = rollout(dynamics_fn, x0, us, params)
-    best_cost = total_cost(cost_fn, term_cost_fn, xs, us, params)
+    cost_prev = total_cost(cost_fn, term_cost_fn, xs, us, params)
     reg = cfg.reg_init
 
     Ks = jnp.zeros((T, nu, nx))
@@ -207,58 +225,60 @@ def ilqr_ddp_single(problem, dynamics_fn, cost_fn, term_cost_fn, cfg):
 
     # 初始化状态包
     # 状态包含: (iter_count, regularization, xs, us, Ks, ks, best_cost, converged_flag)
-    init_state = (jnp.array(0), reg, xs, us, Ks, ks, best_cost, jnp.array(False))
+    init_state = (jnp.array(0), reg, xs, us, Ks, ks, cost_prev, jnp.array(False))
 
     # ==========================================================================
     # 定义单步更新函数 (用于 lax.scan)
     # ==========================================================================
     @jax.checkpoint
     def step_fn(state, _):
-        (i, reg, xs, us, Ks, ks, best_cost, converged) = state
+        (i, reg, xs, us, Ks, ks, cost_prev, converged) = state
 
         # --- 内部更新逻辑 (只在未收敛时执行) ---
         def perform_update(s):
-            (i, reg, xs, us, Ks, ks, best_cost, converged) = s
+            (i, reg, xs, us, Ks, ks, cost_prev, converged) = s
             
             # 1. Backward Pass
             derivs = derivatives(dynamics_fn, cost_fn, term_cost_fn, xs, us, params)
             Ks_new, ks_new, Qu_mean, cond_mean = backward_pass(derivs, reg)
 
             # 2. Line Search (Forward Pass)
-            # 使用内层 scan 遍历 alphas
+            # 更贴近 legacy：按 alpha 顺序寻找第一个下降步，而不是挑全局最优 alpha。
             def try_alpha(carry, alpha):
-                best_tuple = carry
+                accepted_so_far, xs_acc, us_acc, cost_acc, last_cost = carry
                 xs_try, us_try, cost_try = forward_apply_policy(
                     dynamics_fn, cost_fn, term_cost_fn, x0, us, xs, Ks_new, ks_new, alpha, params
                 )
-                improved = cost_try < best_tuple[2]
-                new_best = (xs_try, us_try, cost_try)
-                # 如果 improved，更新 best；否则保持原样
-                out = jax.tree_util.tree_map(lambda a,b: jnp.where(improved, a, b), new_best, best_tuple)
-                return out, None
+                improved_now = jnp.logical_and(~accepted_so_far, cost_try < cost_prev)
+                xs_keep = jax.tree_util.tree_map(lambda a, b: jnp.where(improved_now, a, b), xs_try, xs_acc)
+                us_keep = jax.tree_util.tree_map(lambda a, b: jnp.where(improved_now, a, b), us_try, us_acc)
+                cost_keep = jnp.where(improved_now, cost_try, cost_acc)
+                accepted_next = jnp.logical_or(accepted_so_far, improved_now)
+                return (accepted_next, xs_keep, us_keep, cost_keep, cost_try), None
 
-            init_best = (xs, us, best_cost)
-            # 注意：cfg.line_search_alphas 需要是 JAX 数组
-            alphas_arr = jnp.array(cfg.line_search_alphas)
-            (xs_best, us_best, cost_best), _ = lax.scan(try_alpha, init_best, alphas_arr)
+            init_line = (jnp.array(False), xs, us, cost_prev, cost_prev)
+            alphas_arr = jnp.array(cfg.line_search_alphas, dtype=xs.dtype)
+            (accepted, xs_best, us_best, cost_best, last_cost), _ = lax.scan(try_alpha, init_line, alphas_arr)
 
             # 3. Accept / Reject
-            accepted = cost_best < best_cost
-
             xs_next = jax.tree_util.tree_map(lambda a,b: jnp.where(accepted, a, b), xs_best, xs)
             us_next = jax.tree_util.tree_map(lambda a,b: jnp.where(accepted, a, b), us_best, us)
-            cost_next = jnp.where(accepted, cost_best, best_cost)
-            Ks_out = jax.tree_util.tree_map(lambda a,b: jnp.where(accepted, a, b), Ks_new, Ks)
-            ks_out = jax.tree_util.tree_map(lambda a,b: jnp.where(accepted, a, b), ks_new, ks)
+            # 直接对齐 legacy：本轮结束后 cost_prev 总是更新为“最后一次尝试的 cost_new”，
+            # 即使 line-search 没接受，也不会保留旧 best-cost 门槛。
+            cost_next = jnp.where(accepted, cost_best, last_cost)
+            # legacy 会保留本轮 backward 得到的增益，不依赖是否 accepted。
+            Ks_out = Ks_new
+            ks_out = ks_new
 
             # 4. Update Regularization
-            reg_next = jnp.where(accepted, 
-                                 jnp.maximum(cfg.reg_init, reg * cfg.reg_mult_dec), 
+            # 更贴近 legacy：接受后不主动减小 reg，失败后再放大。
+            reg_next = jnp.where(accepted,
+                                 reg,
                                  jnp.minimum(cfg.reg_max, reg * cfg.reg_mult_inc))
             
             # 5. Check Convergence
-            # 如果接受了更新 且 梯度范数小于阈值，则视为收敛
-            converged_next = jnp.logical_and(accepted, Qu_mean < cfg.tol_g_norm)
+            # legacy 的退出条件只看 Qu 范数阈值，不要求本轮必须 accepted。
+            converged_next = Qu_mean < cfg.tol_g_norm
             
             return (i + 1, reg_next, xs_next, us_next, Ks_out, ks_out, cost_next, converged_next)
             
@@ -281,14 +301,16 @@ def ilqr_ddp_single(problem, dynamics_fn, cost_fn, term_cost_fn, cfg):
     (iters, reg_final, xs, us, Ks, ks, final_cost, converged) = final_state
 
     # 计算最终 Costs (用于 Logging)
-    stage_costs = vmap(lambda x,u: cost_fn(x,u,params))(xs[:-1], us)
-    term_c = term_cost_fn(xs[-1], params)
+    stage_costs = vmap(lambda t, x, u: cost_fn(x, u, _stage_params(params, t)))(
+        jnp.arange(us.shape[0]), xs[:-1], us
+    )
+    term_c = term_cost_fn(xs[-1], _terminal_params(params))
     costs = {"stage": stage_costs, "terminal": term_c, "total": final_cost}
 
     # 确保返回类型一致
     iters_j     = jnp.asarray(iters, dtype=jnp.int32)
     converged_j = jnp.asarray(converged, dtype=bool)
-    reg_final_j = jnp.asarray(reg_final, dtype=jnp.float32)
+    reg_final_j = jnp.asarray(reg_final, dtype=xs.dtype)
 
     return ILQRResult(xs=xs, us=us, Ks=Ks, ks=ks, costs=costs,
                       iters=iters_j,
@@ -304,13 +326,6 @@ def ilqr_ddp_batched(x0, u_init, params,
     Batched iLQR/DDP implementation.
     参数顺序已修正：数据在前，函数在后，以匹配 partial 绑定逻辑。
     """
-    # ==============================================================
-    # [关键修改] 强制转换为 float32
-    # 解决 lax.scan 输入(float64)与输出(float32)类型不匹配的报错
-    # ==============================================================
-    x0 = x0.astype(jnp.float32)
-    u_init = u_init.astype(jnp.float32)
-
     if cfg is None:
         cfg = ILQRConfig()
 
