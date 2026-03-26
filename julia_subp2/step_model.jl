@@ -24,7 +24,9 @@ using ExaModels
 # 7. inequality_residual(...)
 # 8. step_data_from_json / load_step_data
 #                                    # Python/JSON snapshot 如何落成 Julia step
-#
+
+
+# --------- 大致 430 行为分界线 ---------------------
 # 当前主线里可先跳过的部分：
 # - rowmajor_vec(...)
 #   小型兼容 helper，当前主线基本不依赖它

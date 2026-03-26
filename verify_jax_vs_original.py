@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import math
 import time as TM
+import glob
+import re
 from scipy.spatial.transform import Rotation as Rot
 import torch
 import os
@@ -62,6 +64,108 @@ def _safe_nanmax(values):
     if arr.size == 0 or np.all(np.isnan(arr)):
         return float("nan")
     return float(np.nanmax(arr))
+
+
+def _load_stage1_cable_refs(task_idx, horizon, initial_model_stage1, max_iter_admm_stage1, weight_mode_stage1):
+    """
+    与正式 forward 脚本保持一致：
+    从 stage-1 产物中读取 task-specific 的缆绳方向/张力参考。
+    这样 verify 图里的 step=0 就不再是简化写死的 mg/4 起点。
+    """
+    loss_stage1_path = (
+        f"trained_data_meta_COM_Dyn/loss_train_{initial_model_stage1}_{max_iter_admm_stage1}_{weight_mode_stage1}.npy"
+    )
+    i_train_pref = None
+    if os.path.exists(loss_stage1_path):
+        i_train_pref = len(np.load(loss_stage1_path)) - 1
+
+    patt_any = (
+        f"Planning_plots_meta_COM_Dyn/cable_direction_*_{task_idx}_*_{max_iter_admm_stage1}_{weight_mode_stage1}.npy"
+    )
+    cand = []
+    for path in glob.glob(patt_any):
+        match = re.match(
+            r"cable_direction_(\d+)_(\d+)_(\d+)_(\d+)_([a-zA-Z])\.npy$",
+            os.path.basename(path),
+        )
+        if not match:
+            continue
+        i_train_k = int(match.group(1))
+        task_k = int(match.group(2))
+        model1_k = int(match.group(3))
+        admm1_k = int(match.group(4))
+        wm_k = match.group(5)
+        if task_k != task_idx or admm1_k != max_iter_admm_stage1 or wm_k != weight_mode_stage1:
+            continue
+        cand.append((path, i_train_k, model1_k))
+
+    if not cand:
+        raise FileNotFoundError(
+            "No stage-1 cable_direction references found in Planning_plots_meta_COM_Dyn for this task/ADMM/mode."
+        )
+
+    cand_model = [c for c in cand if c[2] == initial_model_stage1]
+    if not cand_model:
+        cand_model = cand
+        print(
+            f"[WARN] No stage-1 references for initial_model_stage1={initial_model_stage1}; "
+            "fallback to available model(s)."
+        )
+
+    chosen = None
+    if i_train_pref is not None:
+        hit = [c for c in cand_model if c[1] == i_train_pref]
+        if hit:
+            chosen = hit[0]
+    if chosen is None:
+        chosen = sorted(cand_model, key=lambda x: x[1], reverse=True)[0]
+
+    di_path, i_train_1, model1_used = chosen
+    ti_path = di_path.replace("cable_direction_", "tension_magnitude_")
+    if not os.path.exists(ti_path):
+        raise FileNotFoundError(f"Matched DI path but TI path missing: {ti_path}")
+
+    print(f"Using stage-1 cable references: i_train_1={i_train_1}, model1={model1_used}")
+    di_ref = np.load(di_path)
+    ti_ref = np.load(ti_path)
+    # 兼容两类历史 reference:
+    # - N+1 个 state 点：直接使用
+    # - 只有 N 个 state 点：把最后一个点复制一份补成 N+1
+    if di_ref.shape[2] < horizon or ti_ref.shape[1] < horizon:
+        raise ValueError("Reference DI/TI horizon is shorter than requested verify horizon")
+    if di_ref.shape[2] == horizon:
+        di_ref = np.concatenate([di_ref, di_ref[:, :, -1:]], axis=2)
+    elif di_ref.shape[2] > horizon + 1:
+        di_ref = di_ref[:, :, : horizon + 1]
+    if ti_ref.shape[1] == horizon:
+        ti_ref = np.concatenate([ti_ref, ti_ref[:, -1:]], axis=1)
+    elif ti_ref.shape[1] > horizon + 1:
+        ti_ref = ti_ref[:, : horizon + 1]
+    return di_ref, ti_ref
+
+
+def _build_cable_reference_lists(di_ref, ti_ref, horizon, nxi, nqi):
+    """
+    把 stage-1 的缆绳方向/张力参考整理成 verify 所需的两份结构：
+    - xq_init_list: 每根缆绳的 task-specific 初始状态
+    - ref_xq_list:  每根缆绳整条 horizon 的参考状态（flatten）
+    """
+    xq_init_list = []
+    ref_xq_list = []
+    for i in range(nqi):
+        ref_xq_mat = np.zeros((horizon + 1, nxi))
+        for k in range(horizon + 1):
+            di_k = np.reshape(di_ref[i][:, k], (3, 1))
+            wi_k = np.zeros((3, 1))
+            ai_k = np.zeros((3, 1))
+            ji_k = np.zeros((3, 1))
+            ti_k = np.reshape(ti_ref[i, k], (1, 1))
+            dti_k = np.zeros((1, 1))
+            xi_k = np.reshape(np.vstack((di_k, wi_k, ai_k, ji_k, ti_k, dti_k)), nxi)
+            ref_xq_mat[k, :] = xi_k
+        xq_init_list.append(ref_xq_mat[0, :].copy())
+        ref_xq_list.append(ref_xq_mat.reshape(-1))
+    return xq_init_list, ref_xq_list
 
 
 # 当前新路线初始化单独封装。
@@ -338,6 +442,19 @@ def verify_jax_planner(task_idx=None, show_plots=None):
     print(f"rho_lx (px): {P_weight1[-4]:.4f}, rho_lu (pu): {P_weight1[-3]:.4f}")
 
     # ================= 生成参考轨迹 =================
+    # Stage-1 缆绳方向/张力参考。
+    # verify 这里也和正式 forward 保持一致，避免把初始张力简化写成统一的 mg/4。
+    initial_model_stage1 = initial_model
+    max_iter_admm_stage1 = max_iter_ADMM
+    weight_mode_stage1 = weight_mode
+    di_ref, ti_ref = _load_stage1_cable_refs(
+        task_idx=task_idx,
+        horizon=horizon,
+        initial_model_stage1=initial_model_stage1,
+        max_iter_admm_stage1=max_iter_admm_stage1,
+        weight_mode_stage1=weight_mode_stage1,
+    )
+
     Coeffx = np.zeros((2,8)); Coeffy = np.zeros((2,8)); Coeffz = np.zeros((2,8))
     # 确保 Reference_traj_4 文件夹存在
     for k in range(2):
@@ -354,8 +471,8 @@ def verify_jax_planner(task_idx=None, show_plots=None):
         Ref_xl_mat[k, :] = ref_x_k.flatten()
         Ref_ul_mat[k, :] = ref_u_k.flatten()
         time_t += dt
-    # 补最后一个点的参考 (通常假设静止或同上)
-    Ref_xl_mat[horizon, :] = Ref_xl_mat[horizon-1, :]
+    ref_x_N, _ = sysm.minisnap_load_circle(Coeffx, Coeffy, Coeffz, time_t, rg_task_val)
+    Ref_xl_mat[horizon, :] = ref_x_N.flatten()
     Ref_xl_flat = Ref_xl_mat.reshape(-1)
     Ref_ul_flat = Ref_ul_mat.reshape(-1)
 
@@ -375,18 +492,13 @@ def verify_jax_planner(task_idx=None, show_plots=None):
     # 构造 Cable 初值和参考
     # 原版 main 脚本里 ref_uq 是一个长向量 [nq*nui]，ref_xq 是 list
     ref_uq_single = np.zeros(nq * MPC_jax.nui) # 全0控制作为参考
-    xq_init_list = [] # list of (nxi,)
-    ref_xq_list = []  # list of (nxi*(N+1),)
-    
-    # 简单的垂直参考
-    # 假设 cl0, mtot 等参数
-    for i in range(nq):
-        # 初始状态: 垂直向下，张力平衡重力
-        xi_0 = np.array([0, 0, 1,   0, 0, 0,   0, 0, 0,   0, 0, 0,   9.81*mtot/nq, 0])
-        xq_init_list.append(xi_0)
-        # 参考轨迹铺满 (Flattened: shape (nxi*(N+1), ) )
-        ref_xq_flat = np.tile(xi_0, horizon + 1)
-        ref_xq_list.append(ref_xq_flat)
+    xq_init_list, ref_xq_list = _build_cable_reference_lists(
+        di_ref=di_ref,
+        ti_ref=ti_ref,
+        horizon=horizon,
+        nxi=MPC_jax.nxi,
+        nqi=nq,
+    )
 
     # ================= 分别执行旧版 / 新版 =================
     # 这里显式拆成两个函数，避免 verify_jax_planner 把两条主线揉在一个大函数里。

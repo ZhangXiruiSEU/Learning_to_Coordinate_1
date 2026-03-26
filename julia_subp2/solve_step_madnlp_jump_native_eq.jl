@@ -25,14 +25,19 @@ using .SubP2StepModel: as_vec,
 #
 # 它和 solve_batch_madnlp_jump_native.jl 的关系是：
 # - 当前 batch 主线真正直接复用的，主要只有 summarize_solution(...)
+
+# 如果你现在只关心"当前正式 batch 主线"，最小阅读顺序是：
+# 1. summarize_solution(...)               # 当前主线直接会用到
+# 2. 其余函数可以先跳过
+
+
+
+# -----------大概 67 行为分界线--------------------
+
 # - 其余大部分函数更偏向：
 #   - 单步离线调试
 #   - 快照/JSON 复现
 #   - 早期单步验证路径
-#
-# 如果你现在只关心"当前正式 batch 主线"，最小阅读顺序是：
-# 1. summarize_solution(...)               # 当前主线直接会用到
-# 2. 其余函数可以先跳过
 #
 # 如果你想理解"单个 step 的原始 JuMP 模型长什么样"，再读：
 # 1. add_native_objective!(...)

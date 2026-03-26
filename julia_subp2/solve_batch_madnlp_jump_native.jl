@@ -53,7 +53,10 @@ include("solve_step_madnlp_jump_native_eq.jl")
 # 5. solve_cached_step_compact!(...)        # 看单步 solve + warm start + 紧凑回包
 # 6. build_cached_step_solver(...)          # 看缓存槽位首次如何构建
 # 7. build_jump_model_eq_parameterized(...) # 最后再看单步 NLP 模型本体
-#
+
+# ---------------大概 1260 行为分界线 ----------
+
+
 # 可以先跳过的内容：
 # - update_parameterized_step!(...)         # legacy JSON step 路径
 # - prepare_batch_payload!(...)             # 预热/诊断入口
