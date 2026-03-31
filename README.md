@@ -282,8 +282,9 @@ run_julia_subp2_fullflow_persistent.py \
       - 使用 `Threads.@threads :static`
   - 当前主机上我们做过对比后，正式复现建议固定 `static`
 
-### 2. 跑代码的注意点
-#### julia是靠[`run_julia_subp2_fullflow_persistent.py`](./run_julia_subp2_fullflow_persistent.py)起的
+## 跑代码的注意点
+
+### julia是靠[`run_julia_subp2_fullflow_persistent.py`](./run_julia_subp2_fullflow_persistent.py)起的
 
 - `verify_jax_vs_original.py` 默认 **不会** 启动 Julia worker
 - 它默认走的是 Python 侧原有的 `jax_ADMM_SubP2(...)`，也就是旧的纯 JAX / `ipoptax SubP2` 验证路径
@@ -298,8 +299,8 @@ run_julia_subp2_fullflow_persistent.py \
 
 - 启动 persistent Julia worker
 - 通过 monkey-patch 把 `MPC_Planner.jax_ADMM_SubP2(...)` 偷换成 Julia IPC 版本
-
-#### 参考文件的问题：似乎缺了文件 
+---
+### 参考文件的问题：似乎缺了文件 
 
 当前这条 verify 链还会读取 stage-1 的缆绳参考文件：
 
@@ -341,8 +342,8 @@ run_julia_subp2_fullflow_persistent.py \
 日志里会表现为：
 
 - `Using stage-1 cable references: i_train_1=18, model1=2`
-
-#### 参考的 horizon 似乎有 N 和N+1 的不统一
+---
+### 参考的 horizon 似乎有 N 和N+1 的不统一
 
 - `run_julia_subp2_fullflow_persistent.py` 内部也是调用 `verify_jax_planner(...)`
 - 所以它沿用的是同一套 stage-1 reference fallback 思路
@@ -362,8 +363,8 @@ run_julia_subp2_fullflow_persistent.py \
 - 如果本来就是 `N+1`，就直接使用
 
 也就是说，现在不是数学定义变了，而是历史文件有两种长度约定，当前代码在做兼容。
-
-### 3. 单独跑 JAX 或原版 forward
+---
+## 单独跑 JAX 或原版 forward（现在跑不通）
 
 这两个脚本主要用于单路 forward 演示，不是正式 benchmark 入口：
 
@@ -373,7 +374,7 @@ python run_original_forward_with_trained_nn.py --task-idx 0
 ```
 
 它们依赖仓库里的训练权重和参考轨迹数据目录。
-
+---
 ## 为什么从 `ipoptax` 切到 Julia `SubP2`
 
 这次切换不是因为 JAX 外层没价值，而是因为真正的瓶颈逐渐收敛到了 `SubP2`。
