@@ -368,12 +368,6 @@ Planning_plots_meta_COM_Dyn/weight_6.npy
 Planning_plots_meta_COM_Dyn/weight_7.npy
 Planning_plots_meta_COM_Dyn/weight_8.npy
 Planning_plots_meta_COM_Dyn/weight_9.npy
-Reference_traj_4/coeffx1.npy
-Reference_traj_4/coeffx2.npy
-Reference_traj_4/coeffy1.npy
-Reference_traj_4/coeffy2.npy
-Reference_traj_4/coeffz1.npy
-Reference_traj_4/coeffz2.npy
 trained_data_meta_COM_Dyn/initial_NN_waypoint.pt
 trained_data_meta_COM_Dyn/rp_task.npy
 trained_data_meta_COM_Dyn/Tunable_para0.npy

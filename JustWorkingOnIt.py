@@ -176,6 +176,8 @@ class MPC_Planner:
         self.rp = np.array([[0.05, 0.05, 0.0]]).T # 参照 main 脚本的 rp0
         self.rg = (self.m2 / self.ml) * self.rp
         # below are code newly add for JAX implementation
+
+        # 没用到 只是一开始用过的会传梯度的函数
         self._load_derivs_jit = _get_global_load_derivs_jit()
         self._cable_derivs_jit = _get_global_cable_derivs_jit()
         # 1. allocation matrix
@@ -213,10 +215,10 @@ class MPC_Planner:
         self._init_load_traj_jit = _get_global_init_load_traj_jit()
         self._init_cable_traj_jit = _get_global_init_cable_traj_jit()
         # 3. subproblem 2
-        def subp2_pure_func(Para2_dict):
-            return self.jax_ADMM_SubP2(Para2_dict)
+        #def subp2_pure_func(Para2_dict):
+        #    return self.jax_ADMM_SubP2(Para2_dict)
         
-        self._subp2_jit = jax.jit(subp2_pure_func)
+        # self._subp2_jit = jax.jit(subp2_pure_func)
 
         # 4. 状态维度定义
 
